@@ -2,6 +2,7 @@ set(demos
     curve1
     surface1
     nonlin1
+    eis
     )
 
 foreach(app ${demos})

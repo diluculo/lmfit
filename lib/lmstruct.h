@@ -17,7 +17,9 @@
 #undef __BEGIN_DECLS
 #undef __END_DECLS
 #ifdef __cplusplus
-#define __BEGIN_DECLS extern "C" {
+#define __BEGIN_DECLS \
+    extern "C"        \
+    {
 #define __END_DECLS }
 #else
 #define __BEGIN_DECLS /* empty */
@@ -36,7 +38,8 @@ __BEGIN_DECLS
 #include <stdio.h>
 
 /* Collection of input parameters for fit control. */
-typedef struct {
+typedef struct
+{
     double ftol;      /* Relative error desired in the sum of squares.
                          Termination occurs when both the actual and
                          predicted relative reductions in the sum of squares
@@ -61,14 +64,15 @@ typedef struct {
                          to patience*(number_of_parameters+1). */
     int scale_diag;   /* If 1, the variables will be rescaled internally.
                          Recommended value is 1. */
-    FILE* msgfile;    /* Progress messages will be written to this file. */
+    FILE *msgfile;    /* Progress messages will be written to this file. */
     int verbosity;    /* OR'ed: 1: print some messages; 2: print Jacobian. */
     int n_maxpri;     /* -1, or max number of parameters to print. */
     int m_maxpri;     /* -1, or max number of residuals to print. */
 } lm_control_struct;
 
 /* Collection of output parameters for status info. */
-typedef struct {
+typedef struct
+{
     double fnorm;  /* norm of the residue vector fvec. */
     int nfev;      /* actual number of iterations. */
     int outcome;   /* Status indicator. Nonnegative values are used as index
@@ -82,8 +86,8 @@ LM_IMPORT extern const lm_control_struct lm_control_float;
 
 /* Preset message texts. */
 
-LM_IMPORT extern const char* lm_infmsg[];
-LM_IMPORT extern const char* lm_shortmsg[];
+LM_IMPORT extern const char *lm_infmsg[];
+LM_IMPORT extern const char *lm_shortmsg[];
 
 __END_DECLS
 #endif /* LMSTRUCT_H */
