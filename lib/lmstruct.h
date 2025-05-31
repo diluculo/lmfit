@@ -37,37 +37,57 @@ __BEGIN_DECLS
 
 #include <stdio.h>
 
+/* Collection of bound constraints for parameters. */
+typedef struct
+{
+    double *lower;   /* Lower bounds array (NULL if no lower bounds) */
+    double *upper;   /* Upper bounds array (NULL if no upper bounds) */
+    double *scales;  /* Parameter scaling factors (NULL if no scaling) */
+    int *bound_type; /* Bound type for each parameter */
+} lm_bounds_struct;
+
+/* Bound type enumeration for each parameter. */
+typedef enum
+{
+    LM_BOUND_NONE = 0,  /* No bounds on this parameter */
+    LM_BOUND_LOWER = 1, /* Lower bound only */
+    LM_BOUND_UPPER = 2, /* Upper bound only */
+    LM_BOUND_BOTH = 3,  /* Both lower and upper bounds */
+    LM_BOUND_FIXED = 4  /* Fixed parameter (not optimized) */
+} lm_bound_type;
+
 /* Collection of input parameters for fit control. */
 typedef struct
 {
-    double ftol;      /* Relative error desired in the sum of squares.
-                         Termination occurs when both the actual and
-                         predicted relative reductions in the sum of squares
-                         are at most ftol. */
-    double xtol;      /* Relative error between last two approximations.
-                         Termination occurs when the relative error between
-                         two consecutive iterates is at most xtol. */
-    double gtol;      /* Orthogonality desired between fvec and its derivs.
-                         Termination occurs when the cosine of the angle
-                         between fvec and any column of the Jacobian is at
-                         most gtol in absolute value. */
-    double epsilon;   /* Step used to calculate the Jacobian, should be
-                         slightly larger than the relative error in the
-                         user-supplied functions. */
-    double stepbound; /* Used in determining the initial step bound. This
-                         bound is set to the product of stepbound and the
-                         Euclidean norm of diag*x if nonzero, or else to
-                         stepbound itself. In most cases stepbound should lie
-                         in the interval (0.1,100.0). Generally, the value
-                         100.0 is recommended. */
-    int patience;     /* Used to set the maximum number of function evaluations
-                         to patience*(number_of_parameters+1). */
-    int scale_diag;   /* If 1, the variables will be rescaled internally.
-                         Recommended value is 1. */
-    FILE *msgfile;    /* Progress messages will be written to this file. */
-    int verbosity;    /* OR'ed: 1: print some messages; 2: print Jacobian. */
-    int n_maxpri;     /* -1, or max number of parameters to print. */
-    int m_maxpri;     /* -1, or max number of residuals to print. */
+    double ftol;              /* Relative error desired in the sum of squares.
+                                 Termination occurs when both the actual and
+                                 predicted relative reductions in the sum of squares
+                                 are at most ftol. */
+    double xtol;              /* Relative error between last two approximations.
+                                 Termination occurs when the relative error between
+                                 two consecutive iterates is at most xtol. */
+    double gtol;              /* Orthogonality desired between fvec and its derivs.
+                                 Termination occurs when the cosine of the angle
+                                 between fvec and any column of the Jacobian is at
+                                 most gtol in absolute value. */
+    double epsilon;           /* Step used to calculate the Jacobian, should be
+                                 slightly larger than the relative error in the
+                                 user-supplied functions. */
+    double stepbound;         /* Used in determining the initial step bound. This
+                                 bound is set to the product of stepbound and the
+                                 Euclidean norm of diag*x if nonzero, or else to
+                                 stepbound itself. In most cases stepbound should lie
+                                 in the interval (0.1,100.0). Generally, the value
+                                 100.0 is recommended. */
+    int patience;             /* Used to set the maximum number of function evaluations
+                                 to patience*(number_of_parameters+1). */
+    int scale_diag;           /* If 1, the variables will be rescaled internally.
+                                 Recommended value is 1. */
+    FILE *msgfile;            /* Progress messages will be written to this file. */
+    int verbosity;            /* OR'ed: 1: print some messages; 2: print Jacobian. */
+    int n_maxpri;             /* -1, or max number of parameters to print. */
+    int m_maxpri;             /* -1, or max number of residuals to print. */
+    lm_bounds_struct *bounds; /* Parameter bounds and scaling (NULL if no bounds) */
 } lm_control_struct;
 
 /* Collection of output parameters for status info. */

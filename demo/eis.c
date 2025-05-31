@@ -1,6 +1,8 @@
 ﻿#include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <errno.h>
+#include <string.h>
 #include "lmmin.h"
 
 #define N 29
@@ -162,10 +164,126 @@ void initialize_y_array()
     }
 }
 
+/* Weighting method enumeration */
+typedef enum
+{
+    WEIGHT_UNITY = 0,         /* No weighting (unit weights) */
+    WEIGHT_MODULUS_MEAS,      /* Weight by 1/|Z_measured|^2 */
+    WEIGHT_PROPORTIONAL_MEAS, /* Weight by 1/|Re|^2 and 1/|Im|^2 separately */
+    WEIGHT_MODULUS_FIT,       /* Weight by 1/|Z_fitted|^2 */
+    WEIGHT_PROPORTIONAL_FIT,  /* Weight by 1/|Re_fit|^2 and 1/|Im_fit|^2 separately */
+    WEIGHT_MODULUS_AUTO,      /* Start with measured, then use fitted */
+    WEIGHT_PROPORTIONAL_AUTO  /* Start with measured proportional, then use fitted */
+} WeightingMethod;
+
+/* Global weighting method and state */
+static WeightingMethod current_weighting = WEIGHT_MODULUS_AUTO; /* Default to auto mode */
+static int evaluation_count = 1;                                /* Flag to track first evaluation for auto modes */
+
+/* Function to set weighting method */
+void set_weighting_method(WeightingMethod method)
+{
+    current_weighting = method;
+    evaluation_count = 1; /* Reset flag when method changes */
+
+    const char *method_names[] = {
+        "Unity (no weighting)",
+        "Modulus measured (1/|Z_meas|^2)",
+        "Proportional measured (1/|Re_meas|^2, 1/|Im_meas|^2)",
+        "Modulus fitted (1/|Z_fit|^2)",
+        "Proportional fitted (1/|Re_fit|^2, 1/|Im_fit|^2)",
+        "Modulus auto (measured->fitted)",
+        "Proportional auto (measured->fitted)"};
+
+    printf("Weighting method set to: %s\n", method_names[method]);
+}
+
+/* Calculate weighting factors for real and imaginary parts separately */
+static void calculate_weights(Complex z_measured, Complex z_fitted,
+                              int use_measured_for_auto,
+                              double *weight_real, double *weight_imag)
+{
+
+    /* For auto modes, decide which data to use */
+    WeightingMethod effective_method = current_weighting;
+    if (current_weighting == WEIGHT_MODULUS_AUTO)
+    {
+        effective_method = use_measured_for_auto ? WEIGHT_MODULUS_MEAS : WEIGHT_MODULUS_FIT;
+    }
+    else if (current_weighting == WEIGHT_PROPORTIONAL_AUTO)
+    {
+        effective_method = use_measured_for_auto ? WEIGHT_PROPORTIONAL_MEAS : WEIGHT_PROPORTIONAL_FIT;
+    }
+
+    switch (effective_method)
+    {
+    case WEIGHT_UNITY:
+        *weight_real = 1.0;
+        *weight_imag = 1.0;
+        break;
+
+    case WEIGHT_MODULUS_MEAS:
+    {
+        /* Weight by 1/|Z_measured|^2 */
+        double magnitude_sq = z_measured.real * z_measured.real +
+                              z_measured.imag * z_measured.imag;
+        double weight = (magnitude_sq > 1e-24) ? (1.0 / magnitude_sq) : 1e24;
+        *weight_real = weight;
+        *weight_imag = weight;
+        break;
+    }
+
+    case WEIGHT_PROPORTIONAL_MEAS:
+    {
+        /* Weight by 1/|Re_measured|^2 and 1/|Im_measured|^2 separately */
+        double real_sq = z_measured.real * z_measured.real;
+        double imag_sq = z_measured.imag * z_measured.imag;
+
+        *weight_real = (real_sq > 1e-24) ? (1.0 / real_sq) : 1e24;
+        *weight_imag = (imag_sq > 1e-24) ? (1.0 / imag_sq) : 1e24;
+        break;
+    }
+
+    case WEIGHT_MODULUS_FIT:
+    {
+        /* Weight by 1/|Z_fitted|^2 */
+        double magnitude_sq = z_fitted.real * z_fitted.real +
+                              z_fitted.imag * z_fitted.imag;
+        double weight = (magnitude_sq > 1e-24) ? (1.0 / magnitude_sq) : 1e24;
+        *weight_real = weight;
+        *weight_imag = weight;
+        break;
+    }
+
+    case WEIGHT_PROPORTIONAL_FIT:
+    {
+        /* Weight by 1/|Re_fitted|^2 and 1/|Im_fitted|^2 separately */
+        double real_sq = z_fitted.real * z_fitted.real;
+        double imag_sq = z_fitted.imag * z_fitted.imag;
+
+        *weight_real = (real_sq > 1e-24) ? (1.0 / real_sq) : 1e24;
+        *weight_imag = (imag_sq > 1e-24) ? (1.0 / imag_sq) : 1e24;
+        break;
+    }
+
+    default:
+        *weight_real = 1.0;
+        *weight_imag = 1.0;
+        break;
+    }
+}
+
+/* Enhanced residual function with separate real/imaginary weighting */
 void evaluate_residuals(const double *par, int m_dat, const void *data, double *fvec, int *info)
 {
     (void)info;
     (void)data;
+
+    evaluation_count++;
+
+    int use_measured_for_auto = (evaluation_count == 1) &&
+                                (current_weighting == WEIGHT_MODULUS_AUTO ||
+                                 current_weighting == WEIGHT_PROPORTIONAL_AUTO);
 
     Params p = {
         .Rstray = par[0],
@@ -180,10 +298,264 @@ void evaluate_residuals(const double *par, int m_dat, const void *data, double *
 
     for (int i = 0; i < N; ++i)
     {
-        Complex z = model_impedance(frequencies[i], &p);
-        fvec[i] = z.real - impedances[i].real;
-        fvec[i + N] = z.imag - impedances[i].imag;
+        Complex z_fitted = model_impedance(frequencies[i], &p);
+        Complex z_measured = impedances[i];
+
+        /* Calculate separate weighting factors for real and imaginary parts */
+        double weight_real, weight_imag;
+        calculate_weights(z_measured, z_fitted, use_measured_for_auto, &weight_real, &weight_imag);
+
+        /* Apply weighted residuals */
+        fvec[i] = weight_real * (z_fitted.real - z_measured.real);     /* Real part */
+        fvec[i + N] = weight_imag * (z_fitted.imag - z_measured.imag); /* Imaginary part */
     }
+}
+
+/* Function to calculate chi-squared with current weighting */
+double calculate_chi_squared(const double *par)
+{
+    Params p = {par[0], par[1], par[2], par[3], par[4], par[5], par[6], par[7], par[8]};
+
+    double chi_sq = 0.0;
+
+    for (int i = 0; i < N; ++i)
+    {
+        Complex z_fitted = model_impedance(frequencies[i], &p);
+        Complex z_measured = impedances[i];
+
+        double weight_real, weight_imag;
+        calculate_weights(z_measured, z_fitted, current_weighting, &weight_real, &weight_imag);
+
+        double residual_real = z_fitted.real - z_measured.real;
+        double residual_imag = z_fitted.imag - z_measured.imag;
+
+        chi_sq += weight_real * weight_real * residual_real * residual_real +
+                  weight_imag * weight_imag * residual_imag * residual_imag;
+    }
+
+    return chi_sq;
+}
+
+/* --- Setup bounds for all parameters (0 to infinity) --- */
+lm_bounds_struct *setup_bounds(int n_par)
+{
+    if (n_par <= 0)
+    {
+        printf("Invalid n_par: %d\n", n_par);
+        return NULL;
+    }
+
+    lm_bounds_struct *bounds = malloc(sizeof(lm_bounds_struct));
+    if (!bounds)
+    {
+        printf("malloc failed for lm_bounds_struct\n");
+        printf("errno = %d\n", errno);
+        return NULL;
+    }
+
+    /* Initialize all pointers to NULL first */
+    bounds->lower = NULL;
+    bounds->upper = NULL;
+    bounds->scales = NULL;
+    bounds->bound_type = NULL;
+
+    bounds->lower = malloc(n_par * sizeof(double));
+    if (!bounds->lower)
+    {
+        printf("Failed to allocate lower array\n");
+        free(bounds);
+        return NULL;
+    }
+
+    bounds->upper = malloc(n_par * sizeof(double));
+    if (!bounds->upper)
+    {
+        printf("Failed to allocate upper array\n");
+        free(bounds->lower);
+        free(bounds);
+        return NULL;
+    }
+
+    bounds->scales = malloc(n_par * sizeof(double));
+    if (!bounds->scales)
+    {
+        printf("Failed to allocate scales array\n");
+        free(bounds->lower);
+        free(bounds->upper);
+        free(bounds);
+        return NULL;
+    }
+
+    bounds->bound_type = malloc(n_par * sizeof(int));
+    if (!bounds->bound_type)
+    {
+        printf("Failed to allocate bound_type array\n");
+        free(bounds->lower);
+        free(bounds->upper);
+        free(bounds->scales);
+        free(bounds);
+        return NULL;
+    }
+
+    /* Set lower bounds to small positive values and appropriate scales */
+    for (int i = 0; i < n_par; i++)
+    {
+        bounds->lower[i] = 0.0;                 /* Small positive lower bound */
+        bounds->bound_type[i] = LM_BOUND_LOWER; /* Lower bound only */
+    }
+
+    /* Special case for Qa1 (CPE exponent): must be between 0 and 1 */
+    bounds->lower[8] = 0.0;
+    bounds->upper[8] = 1.0;
+    bounds->bound_type[8] = LM_BOUND_BOTH; /* Both bounds */
+
+    /* Set appropriate scales for different parameter types */
+    bounds->scales[0] = 1e-3;   /* Rstray - resistance scale */
+    bounds->scales[1] = 1e-6;   /* L1 - inductance scale */
+    bounds->scales[2] = 1e-3;   /* Rs - resistance scale */
+    bounds->scales[3] = 1.0;    /* Cf - capacitance scale */
+    bounds->scales[4] = 1e-3;   /* Rf - resistance scale */
+    bounds->scales[5] = 1.0;    /* Cdl - capacitance scale */
+    bounds->scales[6] = 1e-3;   /* Rct - resistance scale */
+    bounds->scales[7] = 1000.0; /* Qy1 - CPE magnitude scale */
+    bounds->scales[8] = 0.1;    /* Qa1 - CPE exponent scale (0-1) */
+
+    return bounds;
+}
+
+void cleanup_bounds(lm_bounds_struct *bounds)
+{
+    if (bounds)
+    {
+        free(bounds->lower);
+        free(bounds->upper);
+        free(bounds->scales);
+        free(bounds->bound_type);
+        free(bounds);
+    }
+}
+
+/* Enhanced bounds verification function */
+void verify_parameter_bounds(const double *par, const lm_bounds_struct *bounds,
+                             const char **param_names, int n_par)
+{
+    printf("\nParameter bounds verification:\n");
+    int all_valid = 1;
+
+    for (int i = 0; i < n_par; ++i)
+    {
+        int is_valid = 1;
+        char bound_desc[100];
+        char status_msg[20];
+
+        printf("  %-6s = %12.6e  bounds: ", param_names[i], par[i]);
+
+        if (!bounds || bounds->bound_type[i] == LM_BOUND_NONE)
+        {
+            printf("(-oo, +oo)");
+            strcpy(status_msg, "N/A");
+        }
+        else if (bounds->bound_type[i] == LM_BOUND_BOTH)
+        {
+            double lower = bounds->lower[i];
+            double upper = bounds->upper[i];
+            printf("[%.3e, %.3e]", lower, upper);
+
+            is_valid = (par[i] >= lower && par[i] <= upper);
+            strcpy(status_msg, is_valid ? "PASS" : "FAIL");
+        }
+        else if (bounds->bound_type[i] == LM_BOUND_LOWER)
+        {
+            double lower = bounds->lower[i];
+            printf("[%.3e, +oo)", lower);
+
+            is_valid = (par[i] >= lower);
+            strcpy(status_msg, is_valid ? "PASS" : "FAIL");
+        }
+        else if (bounds->bound_type[i] == LM_BOUND_UPPER)
+        {
+            double upper = bounds->upper[i];
+            printf("(-oo, %.3e]", upper);
+
+            is_valid = (par[i] <= upper);
+            strcpy(status_msg, is_valid ? "PASS" : "FAIL");
+        }
+        else if (bounds->bound_type[i] == LM_BOUND_FIXED)
+        {
+            printf("FIXED");
+            strcpy(status_msg, "FIXED");
+        }
+        else
+        {
+            printf("unknown");
+            strcpy(status_msg, "ERROR");
+            is_valid = 0;
+        }
+
+        printf("  [%s]\n", status_msg);
+
+        if (!is_valid && bounds && bounds->bound_type[i] != LM_BOUND_NONE)
+        {
+            all_valid = 0;
+        }
+    }
+
+    if (!bounds)
+    {
+        printf("\nBounds check: No bounds specified\n");
+    }
+    else
+    {
+        printf("\nAll bounds satisfied: %s\n", all_valid ? "PASS" : "FAIL");
+    }
+}
+
+/* Function to print detailed frequency-by-frequency comparison */
+void print_frequency_comparison(const double *par)
+{
+    Params p = {par[0], par[1], par[2], par[3], par[4], par[5], par[6], par[7], par[8]};
+
+    printf("\nFrequency comparison (Magnitude & Phase):\n");
+    printf(" Freq [Hz]   |Z_meas|      Phase_meas   |Z_fit|       Phase_fit    |Z|_Error%%  Phase_Error\n");
+    printf("-----------  ------------  -----------  ------------  -----------  ----------  -----------\n");
+
+    double total_mag_error = 0.0;
+    double total_phase_error = 0.0;
+
+    for (int i = 0; i < N; ++i)
+    {
+        Complex z_fitted = model_impedance(frequencies[i], &p);
+        Complex z_measured = impedances[i];
+
+        /* Calculate magnitude and phase */
+        double mag_meas = sqrt(z_measured.real * z_measured.real + z_measured.imag * z_measured.imag);
+        double phase_meas = atan2(z_measured.imag, z_measured.real) * 180.0 / PI;
+
+        double mag_fit = sqrt(z_fitted.real * z_fitted.real + z_fitted.imag * z_fitted.imag);
+        double phase_fit = atan2(z_fitted.imag, z_fitted.real) * 180.0 / PI;
+
+        /* Calculate errors */
+        double mag_error_pct = 100.0 * (mag_fit - mag_meas) / mag_meas;
+        double phase_error = phase_fit - phase_meas;
+
+        /* Handle phase wraparound */
+        if (phase_error > 180.0)
+            phase_error -= 360.0;
+        if (phase_error < -180.0)
+            phase_error += 360.0;
+
+        printf("%11.3f  %9.6e  %11.2f  %9.6e  %11.2f  %10.2f  %11.2f\n",
+               frequencies[i], mag_meas, phase_meas, mag_fit, phase_fit,
+               mag_error_pct, phase_error);
+
+        /* Accumulate absolute errors for summary */
+        total_mag_error += fabs(mag_error_pct);
+        total_phase_error += fabs(phase_error);
+    }
+
+    printf("-----------  ------------  -----------  ------------  -----------  ----------  -----------\n");
+    printf("Average absolute error:                                            %10.2f  %11.2f\n",
+           total_mag_error / N, total_phase_error / N);
 }
 
 /* --- Main function --- */
@@ -192,46 +564,113 @@ int main()
 {
     const int n_par = 9;
 
-    // Initial guess for parameters
-    // double par[9] = {
-    //     0.0001,  // Rstray
-    //     2e-7,    // L1
-    //     0.00055, // Rs
-    //     2.5,     // Cf
-    //     0.00028, // Rf
-    //     18.0,    // Cdl
-    //     0.00022, // Rct
-    //     6000,    // Qy1
-    //     0.7      // Qa1
-    // };
+    /* Parameter names for better output */
+    const char *param_names[] = {
+        "Rstray", "L1", "Rs", "Cf", "Rf", "Cdl", "Rct", "Qy1", "Qa1"};
 
+    // Initial guess for parameters
     double par[9] = {
-        10e-3,  // Rstray
-        100e-9, // L1
-        400e-6, // Rs
-        100,    // Cf
-        60e-6,  // Rf
-        5,      // Cdl
-        200e-6, // Rct
-        2000,   // Qy1
-        0.7     // Qa1
+        10e-3,    // 0.0001,  // Rstray
+        103.7e-9, // 2e-7,    // L1
+        408.6e-6, // 0.00055, // Rs
+        109.4,    // 2.5,     // Cf
+        64.7e-6,  // 0.00028, // Rf
+        6.185,    // 18.0,    // Cdl
+        171.4e-6, // 0.00022, // Rct
+        2500,     // 6000,    // Qy1
+        0.7       // Qa1
     };
 
     initialize_y_array();
 
+    /* For automatic selection: */
+    set_weighting_method(WEIGHT_MODULUS_AUTO);
+
+    /* Setup bounds for all parameters (0 to infinity) */
+    lm_bounds_struct *bounds = setup_bounds(n_par);
+    if (!bounds)
+    {
+        fprintf(stderr, "Error: Failed to allocate bounds\n");
+        return 1;
+    }
+
+    printf("Initial parameters and bounds:\n");
+    for (int i = 0; i < n_par; ++i)
+    {
+        printf("  %-6s: %12.6g on ", param_names[i], par[i]);
+
+        if (!bounds || bounds->bound_type[i] == LM_BOUND_NONE)
+        {
+            printf("(-oo, +oo)");
+        }
+        else if (bounds->bound_type[i] == LM_BOUND_BOTH)
+        {
+            printf("[%.3e, %.3e]", bounds->lower[i], bounds->upper[i]);
+        }
+        else if (bounds->bound_type[i] == LM_BOUND_LOWER)
+        {
+            printf("[%.3e, +oo)", bounds->lower[i]);
+        }
+        else if (bounds->bound_type[i] == LM_BOUND_UPPER)
+        {
+            printf("(-oo, %.3e]", bounds->upper[i]);
+        }
+        else if (bounds->bound_type[i] == LM_BOUND_FIXED)
+        {
+            printf("FIXED");
+        }
+
+        printf("\n");
+    }
+    printf("\n");
+
+    printf("Starting bounded optimization...\n\n");
+
+    /* Setup control structure with bounds */
     lm_control_struct control = lm_control_double;
-    control.stepbound = 0.001; // Initial step bound
-    control.patience = 500;    // Maximum number of function evaluations
-    control.scale_diag = 1;    // Rescale variables internally
+    control.stepbound = 0.1; /* Initial step bound */
+    control.patience = 1000; /* Maximum number of function evaluations */
+    control.scale_diag = 1;  /* Rescale variables internally */
+    control.bounds = bounds; /* Apply bounds */
+    control.verbosity = 3;   /* Print more information */
+
+    /* Adjust tolerances for better convergence with bounds */
+    control.ftol = 1e-15;
+    control.xtol = 1e-15;
+    control.gtol = 1e-15;
 
     lm_status_struct status;
-    control.verbosity = 2;
 
-    lmmin(n_par, par, 2 * N, y, NULL, evaluate_residuals, &control, &status);
+    lmmin2(n_par, par, NULL, NULL, 2 * N, y, NULL, evaluate_residuals, &control, &status);
 
-    printf("\nFitted parameters:\n");
+    printf("\nOptimization completed with status: %s\n", lm_infmsg[status.outcome]);
+    printf("Number of function evaluations: %d\n", status.nfev);
+    printf("Final residual norm: %.6e\n\n", status.fnorm);
+
+    printf("Fitted parameters:\n");
     for (int i = 0; i < n_par; ++i)
-        printf("  par[%d] = %.10g\n", i, par[i]);
+        printf("  %-6s = %.10g\n", param_names[i], par[i]);
 
+    /* Comprehensive bounds verification */
+    verify_parameter_bounds(par, bounds, param_names, n_par);
+
+    /* Calculate final model fit quality */
+    double total_error = 0.0;
+    for (int i = 0; i < N; ++i)
+    {
+        Params p = {par[0], par[1], par[2], par[3], par[4], par[5], par[6], par[7], par[8]};
+        Complex z_model = model_impedance(frequencies[i], &p);
+        Complex z_meas = impedances[i];
+
+        double error_real = z_model.real - z_meas.real;
+        double error_imag = z_model.imag - z_meas.imag;
+        total_error += error_real * error_real + error_imag * error_imag;
+    }
+
+    printf("Total squared error: %.6e\n\n", total_error);
+
+    print_frequency_comparison(par);
+
+    cleanup_bounds(bounds);
     return 0;
 }
