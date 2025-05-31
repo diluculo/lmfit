@@ -193,24 +193,36 @@ int main()
     const int n_par = 9;
 
     // Initial guess for parameters
+    // double par[9] = {
+    //     0.0001,  // Rstray
+    //     2e-7,    // L1
+    //     0.00055, // Rs
+    //     2.5,     // Cf
+    //     0.00028, // Rf
+    //     18.0,    // Cdl
+    //     0.00022, // Rct
+    //     6000,    // Qy1
+    //     0.7      // Qa1
+    // };
+
     double par[9] = {
-        0.0001,  // Rstray
-        2e-7,    // L1
-        0.00055, // Rs
-        2.5,     // Cf
-        0.00028, // Rf
-        18.0,    // Cdl
-        0.00022, // Rct
-        6000,    // Qy1
-        0.7      // Qa1
+        10e-3,  // Rstray
+        100e-9, // L1
+        400e-6, // Rs
+        100,    // Cf
+        60e-6,  // Rf
+        5,      // Cdl
+        200e-6, // Rct
+        2000,   // Qy1
+        0.7     // Qa1
     };
 
     initialize_y_array();
 
     lm_control_struct control = lm_control_double;
-    control.stepbound = 0.01; // Initial step bound
-    control.patience = 200;   // Maximum number of function evaluations
-    control.scale_diag = 1;   // Rescale variables internally
+    control.stepbound = 0.001; // Initial step bound
+    control.patience = 500;    // Maximum number of function evaluations
+    control.scale_diag = 1;    // Rescale variables internally
 
     lm_status_struct status;
     control.verbosity = 2;

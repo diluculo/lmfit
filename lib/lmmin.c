@@ -199,6 +199,10 @@ void lmmin2(
     double xnorm = 0;
     double eps = sqrt(MAX(C->epsilon, LM_MACHEP)); /* for forward differences */
 
+    int ncsuc = 0;   // number of consecutive successful iterations
+    int ncfail = 0;  // number of consecutive failed iterations
+    double nu = 2.0; // multiplication factor for mu updates
+
     int nout = C->n_maxpri == -1 ? n : MIN(C->n_maxpri, n);
 
     /* The workaround msgfile=NULL is needed for default initialization */
@@ -470,18 +474,27 @@ void lmmin2(
             /* first iteration only */
             if (C->scale_diag)
             {
-                /* diag := norms of the columns of the initial Jacobian */
+                /* diag := norms of the columns of the initial Jacobian (MINPACK style) */
                 for (j = 0; j < n; j++)
-                    diag[j] = wa2[j] ? wa2[j] : 1;
-                /* xnorm := || D x || */
+                {
+                    diag[j] = wa2[j]; /* wa2 contains column norms from qrfac */
+                    if (diag[j] == 0.0)
+                    {
+                        diag[j] = 1.0; /* MINPACK: use 1.0 for zero columns */
+                    }
+                }
+
+                /* xnorm := || D x || (scaled parameter norm) */
                 for (j = 0; j < n; j++)
                     wa3[j] = diag[j] * x[j];
                 xnorm = lm_enorm(n, wa3);
             }
             else
             {
+                /* mode != 2: use unscaled parameter norm */
                 xnorm = lm_enorm(n, x);
             }
+
             if (!isfinite(xnorm))
             {
                 if (C->verbosity)
@@ -489,11 +502,14 @@ void lmmin2(
                 S->outcome = 12; /* nan */
                 goto terminate;
             }
-            /* initialize the step bound delta. */
-            if (xnorm)
-                delta = C->stepbound * xnorm;
-            else
-                delta = C->stepbound;
+
+            /* initialize the step bound delta (MINPACK style) */
+            delta = C->stepbound * xnorm;
+            if (delta == 0.0)
+            {
+                delta = C->stepbound; /* MINPACK: use factor directly if xnorm is zero */
+            }
+
             /* only now print the header for the loop table */
             if (C->verbosity & 2)
             {
@@ -507,10 +523,13 @@ void lmmin2(
         }
         else
         {
+            /* subsequent iterations: rescale if necessary (MINPACK style) */
             if (C->scale_diag)
             {
                 for (j = 0; j < n; j++)
-                    diag[j] = MAX(diag[j], wa2[j]);
+                {
+                    diag[j] = fmax(diag[j], wa2[j]); /* keep the larger scaling factor */
+                }
             }
         }
 
@@ -601,31 +620,60 @@ void lmmin2(
                 fprintf(msgfile, "\n");
             }
 
-            /* update the step bound */
-            if (ratio <= 0.25)
+            /* Update trust region based on reduction ratio */
+            if (ratio < 0.0001)
             {
-                if (actred >= 0)
-                    temp = 0.5;
-                else
-                    temp = 0.5 * dirder / (dirder + 0.5 * actred);
-                if (p1 * fnorm1 >= fnorm || temp < p1)
-                    temp = p1;
-                delta = temp * MIN(delta, pnorm / p1);
-                lmpar /= temp;
+                // Failure: ratio too small
+                ncsuc = 0;
+                ncfail++;
+
+                lmpar = lmpar * nu;
+                nu = 2.0 * nu;
+
+                delta = 0.25 * delta;
             }
-            else if (lmpar == 0 || ratio >= 0.75)
+            else if (ratio < 0.25)
             {
-                delta = 2 * pnorm;
-                lmpar *= 0.5;
+                // Accept but shrink
+                ncfail = 0;
+                ncsuc = 0;
+
+                delta = 0.5 * delta;
+
+                double temp = 1.0 - pow((2.0 * ratio - 1.0), 3);
+                temp = fmax(temp, 1.0 / 3.0);
+                lmpar = lmpar * temp;
+            }
+            else if (ratio < 0.75)
+            {
+                // Accept + mild delta increase
+                ncsuc++;
+                ncfail = 0;
+
+                delta = fmax(delta, pnorm);
+
+                double temp = 1.0 - pow((2.0 * ratio - 1.0), 3);
+                temp = fmax(temp, 1.0 / 3.0);
+                lmpar = lmpar * temp;
+            }
+            else
+            {
+                // ratio >= 0.75
+                ncsuc++;
+                ncfail = 0;
+
+                delta = fmax(delta, 2.0 * pnorm);
+
+                double temp = 1.0 - pow((2.0 * ratio - 1.0), 3);
+                temp = fmax(temp, 1.0 / 3.0);
+                lmpar = lmpar * temp;
             }
 
-            /***  [inner]  On success, update solution, and test for convergence.  ***/
-
-            inner_success = ratio >= p0001;
+            /* Test for successful iteration */
+            inner_success = ratio >= 0.0001;
             if (inner_success)
             {
-
-                /* update x, fvec, and their norms */
+                /* Update parameters */
                 if (C->scale_diag)
                 {
                     for (j = 0; j < n; j++)
@@ -650,20 +698,33 @@ void lmmin2(
                     goto terminate;
                 }
                 fnorm = fnorm1;
-            }
 
-            /* convergence tests */
-            S->outcome = 0;
-            if (fnorm <= LM_DWARF)
-                goto terminate; /* success: sum of squares almost zero */
-            /* test two criteria (both may be fulfilled) */
-            if (fabs(actred) <= C->ftol && prered <= C->ftol && ratio <= 2)
-                S->outcome = 1; /* success: x almost stable */
-            if (delta <= C->xtol * xnorm)
-                S->outcome += 2; /* success: sum of squares almost stable */
-            if (S->outcome != 0)
+                /* Check convergence criteria */
+                S->outcome = 0;
+                if (fnorm <= LM_DWARF)
+                    goto terminate; /* success: sum of squares almost zero */
+
+                /* test two criteria (both may be fulfilled) */
+                if ((fabs(actred) <= C->ftol) && (prered <= C->ftol) && (0.5 * ratio <= 1.0))
+                    S->outcome = 1; /* F-convergence */
+                if (delta <= C->xtol * xnorm)
+                    S->outcome = 2; /* X-convergence */
+                if ((fabs(actred) <= C->ftol) && (prered <= C->ftol) && (0.5 * ratio <= 1.0) && (S->outcome == 2))
+                    S->outcome = 3; /* Both F and X convergence */
+                if (S->outcome != 0)
+                    goto terminate;
+            }
+            else
             {
-                goto terminate;
+                /* Step was rejected */
+                lmpar = lmpar * nu;
+                nu = 2.0 * nu;
+
+                /* If we're making no progress, exit the inner loop */
+                if (ncfail >= 2)
+                {
+                    break; /* Exit inner loop, try a new Jacobian */
+                }
             }
 
             /***  [inner]  Tests for termination and stringent tolerances.  ***/
