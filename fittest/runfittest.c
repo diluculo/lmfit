@@ -8,24 +8,25 @@
 
 lm_control_struct control;
 
-typedef struct {
+typedef struct
+{
     ffunc_type f;
 } eval_data_struct;
 
 void evaluate(
-    const double* x, int m, const void* data, double* fvec, int* outcome)
+    const double *x, int m, const void *data, double *fvec, int *outcome)
 {
-    const eval_data_struct* edata = (const eval_data_struct*) data;
+    const eval_data_struct *edata = (const eval_data_struct *)data;
     ffunc_type f = edata->f;
     (*f)(x, m, fvec);
 }
 
-void minimizer(int n, double* x, int m, double* y, ffunc_type f, int* outcome, int* nfev)
+void minimizer(int n, double *x, int m, double *y, ffunc_type f, int *outcome, int *nfev)
 {
     lm_status_struct status;
     eval_data_struct edata;
     edata.f = f;
-    lmmin( n, x, m, y, (void*) &edata, evaluate, &control, &status );
+    lmmin(n, x, m, y, (void *)&edata, evaluate, &control, &status);
     *outcome = status.outcome;
     *nfev = status.nfev;
 }
@@ -36,12 +37,15 @@ int main(int argc, char **argv)
     control.patience = 1000;
     // Parse minimizer-specific options.
     int c;
-    while ((c = getopt (argc, argv, "he:t:v:")) != -1) {
-        switch (c) {
+    while ((c = getopt(argc, argv, "he:t:v:")) != -1)
+    {
+        switch (c)
+        {
         case 'e':
             control.epsilon = atof(optarg);
             break;
-        case 't': {
+        case 't':
+        {
             double tol = atof(optarg);
             control.ftol = tol;
             control.gtol = tol;

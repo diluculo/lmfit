@@ -51,3 +51,8 @@ if (FITTEST)
     find_package(FitTest REQUIRED)
     add_subdirectory(fittest)
 endif()
+
+option(BUILD_EIS "Build EIS Framework" ON)
+if(BUILD_EIS)
+    add_subdirectory(eis_framework)
+endif()
