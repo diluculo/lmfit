@@ -405,9 +405,9 @@ lm_bounds_struct *setup_bounds(int n_par)
     }
 
     /* Special case for Qa1 (CPE exponent): must be between 0 and 1 */
-    bounds->lower[8] = 0.0;
-    bounds->upper[8] = 1.0;
-    bounds->bound_type[8] = LM_BOUND_BOTH; /* Both bounds */
+    // bounds->lower[8] = 0.0;
+    // bounds->upper[8] = 1.0;
+    // bounds->bound_type[8] = LM_BOUND_BOTH; /* Both bounds */
 
     /* Set appropriate scales for different parameter types */
     bounds->scales[0] = 1e-3;   /* Rstray - resistance scale */
@@ -418,7 +418,7 @@ lm_bounds_struct *setup_bounds(int n_par)
     bounds->scales[5] = 1.0;    /* Cdl - capacitance scale */
     bounds->scales[6] = 1e-3;   /* Rct - resistance scale */
     bounds->scales[7] = 1000.0; /* Qy1 - CPE magnitude scale */
-    bounds->scales[8] = 0.1;    /* Qa1 - CPE exponent scale (0-1) */
+    bounds->scales[8] = 0.5;    /* Qa1 - CPE exponent scale (0-1) */
 
     return bounds;
 }
@@ -570,21 +570,21 @@ int main()
 
     // Initial guess for parameters
     double par[9] = {
-        10e-3,    // 0.0001,  // Rstray
-        103.7e-9, // 2e-7,    // L1
-        408.6e-6, // 0.00055, // Rs
-        109.4,    // 2.5,     // Cf
-        64.7e-6,  // 0.00028, // Rf
-        6.185,    // 18.0,    // Cdl
-        171.4e-6, // 0.00022, // Rct
-        2500,     // 6000,    // Qy1
-        0.7       // Qa1
+        0.0001,  // Rstray
+        2e-7,    // L1
+        0.00055, // Rs
+        2.5,     // Cf
+        0.00028, // Rf
+        18.0,    // Cdl
+        0.00022, // Rct
+        6000,    // Qy1
+        0.7      // Qa1
     };
 
     initialize_y_array();
 
     /* For automatic selection: */
-    set_weighting_method(WEIGHT_MODULUS_AUTO);
+    set_weighting_method(WEIGHT_MODULUS_MEAS);
 
     /* Setup bounds for all parameters (0 to infinity) */
     lm_bounds_struct *bounds = setup_bounds(n_par);

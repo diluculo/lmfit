@@ -82,6 +82,137 @@ static double calculate_step_size(double x, int use_optimal_step)
 /*  Parameter projection functions for bound constraints                     */
 /*****************************************************************************/
 
+static double get_safe_scale(double scale_value, double fallback_scale, const char *source)
+{
+    if (isfinite(scale_value) && scale_value != 0.0)
+    {
+        if (scale_value < 0.0)
+        {
+            /* Convert negative to positive */
+            fprintf(stderr, "Warning: Negative %s scale %.6e converted to %.6e\n",
+                    source, scale_value, -scale_value);
+            return -scale_value; /* Return absolute value */
+        }
+        return scale_value; /* Already positive */
+    }
+    else
+    {
+        /* Zero, NaN, or Inf - use fallback */
+        if (scale_value == 0.0)
+        {
+            fprintf(stderr, "Warning: Zero %s scale, using fallback %.6e\n", source, fallback_scale);
+        }
+        else
+        {
+            fprintf(stderr, "Warning: Invalid %s scale %.6e, using fallback %.6e\n",
+                    source, scale_value, fallback_scale);
+        }
+        return fallback_scale;
+    }
+}
+
+/* Safe parameter scaling that handles negative parameter values and bound validation */
+static double apply_parameter_scaling(double param_value, double scale,
+                                      double lower_bound, double upper_bound,
+                                      int bound_type)
+{
+    /* Validate scale first */
+    if (scale <= 0.0 || !isfinite(scale))
+    {
+        fprintf(stderr, "Warning: Invalid scale %.6e, using 1.0\n", scale);
+        scale = 1.0; /* Safe fallback */
+    }
+
+    double adjusted_param = param_value;
+
+    /* Validate and adjust parameter based on bound constraints */
+    switch (bound_type)
+    {
+    case LM_BOUND_BOTH:
+        if (!isfinite(lower_bound) || !isfinite(upper_bound) || upper_bound <= lower_bound)
+        {
+            fprintf(stderr, "Error: Invalid bounds [%.6e, %.6e]\n", lower_bound, upper_bound);
+            break;
+        }
+        if (param_value < lower_bound)
+        {
+            fprintf(stderr, "Warning: Parameter %.6e below lower bound %.6e, adjusting\n",
+                    param_value, lower_bound);
+            adjusted_param = lower_bound + 1e-15 * fabs(lower_bound) + 1e-15;
+        }
+        else if (param_value > upper_bound)
+        {
+            fprintf(stderr, "Warning: Parameter %.6e above upper bound %.6e, adjusting\n",
+                    param_value, upper_bound);
+            adjusted_param = upper_bound - 1e-15 * fabs(upper_bound) - 1e-15;
+        }
+        break;
+
+    case LM_BOUND_LOWER:
+        if (!isfinite(lower_bound))
+        {
+            fprintf(stderr, "Error: Invalid lower bound %.6e\n", lower_bound);
+            break;
+        }
+        if (param_value < lower_bound)
+        {
+            fprintf(stderr, "Warning: Parameter %.6e below lower bound %.6e, adjusting\n",
+                    param_value, lower_bound);
+            adjusted_param = lower_bound + 1e-15 * fmax(1.0, fabs(lower_bound)) + 1e-15;
+        }
+        break;
+
+    case LM_BOUND_UPPER:
+        if (!isfinite(upper_bound))
+        {
+            fprintf(stderr, "Error: Invalid upper bound %.6e\n", upper_bound);
+            break;
+        }
+        if (param_value > upper_bound)
+        {
+            fprintf(stderr, "Warning: Parameter %.6e above upper bound %.6e, adjusting\n",
+                    param_value, upper_bound);
+            adjusted_param = upper_bound - 1e-15 * fmax(1.0, fabs(upper_bound)) - 1e-15;
+        }
+        break;
+
+    case LM_BOUND_FIXED:
+        /* For fixed parameters, use the bound value (stored in lower_bound) */
+        if (isfinite(lower_bound))
+        {
+            adjusted_param = lower_bound;
+        }
+        break;
+
+    case LM_BOUND_NONE:
+    default:
+        /* No bounds - parameter can be any finite value including negative */
+        if (!isfinite(param_value))
+        {
+            fprintf(stderr, "Warning: Non-finite parameter %.6e, using 0.0\n", param_value);
+            adjusted_param = 0.0;
+        }
+        break;
+    }
+
+    /* Apply scaling to the adjusted parameter */
+    double scaled_param = adjusted_param / scale;
+
+    /* Validate result */
+    if (!isfinite(scaled_param))
+    {
+        fprintf(stderr, "Warning: Non-finite scaled parameter (%.6e / %.6e), using fallback\n",
+                adjusted_param, scale);
+        scaled_param = adjusted_param; /* Try without scaling */
+        if (!isfinite(scaled_param))
+        {
+            scaled_param = 0.0; /* Last resort */
+        }
+    }
+
+    return scaled_param;
+}
+
 /* Project external parameters to internal parameter space.
    Internal parameters are unconstrained and can be optimized freely.
    The transformation handles different bound types:
@@ -90,57 +221,99 @@ static double calculate_step_size(double x, int use_optimal_step)
    - Upper bound only: uses sqrt transformation
    - No bounds with scaling: simple division */
 static void lm_project_to_internal(const int n, const double *pext, double *pint,
-                                   const lm_bounds_struct *bounds)
+                                   const lm_bounds_struct *bounds,
+                                   const double *auto_scales,
+                                   int use_auto_scale)
 {
     if (!bounds)
     {
-        /* No bounds, parameters are already internal */
-        memcpy(pint, pext, n * sizeof(double));
+        /* No bounds: apply auto scaling if enabled */
+        if (use_auto_scale && auto_scales)
+        {
+            for (int i = 0; i < n; i++)
+            {
+                double scale = get_safe_scale(auto_scales[i], 1.0, "auto");
+                pint[i] = pext[i] / scale;
+            }
+        }
+        else
+        {
+            memcpy(pint, pext, n * sizeof(double));
+        }
+        return;
+    }
+
+    /* Check if this is a scales-only bounds (no actual bounds) */
+    if (!bounds->bound_type && bounds->scales)
+    {
+        /* Only user scales, no bounds - apply scaling directly */
+        for (int i = 0; i < n; i++)
+        {
+            double scale = get_safe_scale(bounds->scales[i], 1.0, "user");
+            pint[i] = pext[i] / scale;
+        }
         return;
     }
 
     for (int i = 0; i < n; i++)
     {
-        if (bounds->bound_type[i] == LM_BOUND_BOTH)
+        /* Determine effective scaling factor - only for cases that need it */
+        double scale = 1.0;
+
+        if (bounds->scales)
         {
-            /* Case 1: lower < Pext < upper
-               Pint = asin(2 * (Pext - lower) / (upper - lower) - 1) */
+            scale = get_safe_scale(bounds->scales[i], 1.0, "user");
+        }
+        else if (use_auto_scale && auto_scales)
+        {
+            scale = get_safe_scale(auto_scales[i], 1.0, "auto");
+        }
+
+        /* Check if bound_type exists before accessing it */
+        int bound_type = LM_BOUND_NONE;
+        if (bounds->bound_type)
+        {
+            bound_type = bounds->bound_type[i];
+        }
+
+        if (bound_type == LM_BOUND_BOTH)
+        {
+            /* Case 1: Both bounds - NO scaling applied */
             double lower = bounds->lower[i];
             double upper = bounds->upper[i];
             double normalized = 2.0 * (pext[i] - lower) / (upper - lower) - 1.0;
-
-            /* Clamp to avoid numerical issues with asin domain */
-            normalized = fmax(-0.99999, fmin(0.99999, normalized));
+            /* Clamp to avoid asin domain errors from floating-point precision issues
+             * that could push normalized slightly outside [-1, 1] (e.g., -1.0000000000000002, 1.0000000000000004) */
+            normalized = fmax(-0.9999999999, fmin(0.999999999, normalized));
             pint[i] = asin(normalized);
         }
-        else if (bounds->bound_type[i] == LM_BOUND_LOWER)
+        else if (bound_type == LM_BOUND_LOWER)
         {
-            /* Case 2: lower < Pext
-               Pint = sqrt((Pext/scale - lower/scale + 1)^2 - 1) */
+            /* Case 2: Lower bound only - conditional scaling */
             double lower = bounds->lower[i];
-            double scale = bounds->scales ? bounds->scales[i] : 1.0;
+
+            /* sqrt(((Pext - lower)/scale + 1)^2 - 1) */
             double temp = (pext[i] - lower) / scale + 1.0;
             pint[i] = sqrt(fmax(0.0, temp * temp - 1.0));
         }
-        else if (bounds->bound_type[i] == LM_BOUND_UPPER)
+        else if (bound_type == LM_BOUND_UPPER)
         {
-            /* Case 3: Pext < upper
-               Pint = sqrt((upper/scale - Pext/scale + 1)^2 - 1) */
+            /* Case 3: Upper bound only - conditional scaling */
             double upper = bounds->upper[i];
-            double scale = bounds->scales ? bounds->scales[i] : 1.0;
+
+            /* sqrt(((upper - Pext)/scale + 1)^2 - 1) */
             double temp = (upper - pext[i]) / scale + 1.0;
             pint[i] = sqrt(fmax(0.0, temp * temp - 1.0));
         }
-        else if (bounds->bound_type[i] == LM_BOUND_NONE && bounds->scales)
+        else if (bound_type == LM_BOUND_FIXED)
         {
-            /* Case 4: no bounds, but scales
-               Pint = Pext / scale */
-            pint[i] = pext[i] / bounds->scales[i];
+            /* Fixed parameter: preserve the value in internal space */
+            pint[i] = pext[i]; /* Keep the same value */
         }
         else
         {
-            /* No transformation needed */
-            pint[i] = pext[i];
+            /* Case 4: No bounds - apply scaling only if available */
+            pint[i] = pext[i] / scale;
         }
     }
 }
@@ -148,47 +321,93 @@ static void lm_project_to_internal(const int n, const double *pext, double *pint
 /* Project internal parameters back to external parameter space.
    This is the inverse transformation of lm_project_to_internal. */
 static void lm_project_to_external(const int n, const double *pint, double *pext,
-                                   const lm_bounds_struct *bounds)
+                                   const lm_bounds_struct *bounds,
+                                   const double *auto_scales,
+                                   int use_auto_scale)
 {
     if (!bounds)
     {
-        /* No bounds, parameters are already external */
-        memcpy(pext, pint, n * sizeof(double));
+        /* No bounds: apply auto scaling if enabled */
+        if (use_auto_scale && auto_scales)
+        {
+            for (int i = 0; i < n; i++)
+            {
+                double scale = get_safe_scale(auto_scales[i], 1.0, "auto");
+                pext[i] = pint[i] * scale;
+            }
+        }
+        else
+        {
+            memcpy(pext, pint, n * sizeof(double));
+        }
         return;
     }
 
+    /* Check if this is a scales-only bounds (no actual bounds) */
+    if (!bounds->bound_type && bounds->scales)
+    {
+        /* Only user scales, no bounds - apply scaling directly */
+        for (int i = 0; i < n; i++)
+        {
+            double scale = get_safe_scale(bounds->scales[i], 1.0, "user");
+            pext[i] = pint[i] * scale;
+        }
+        return;
+    }
+
+    /* Handle cases with actual bounds */
     for (int i = 0; i < n; i++)
     {
-        if (bounds->bound_type[i] == LM_BOUND_BOTH)
+        /* Determine effective scaling factor */
+        double scale = 1.0;
+
+        if (bounds->scales)
         {
-            /* Case 1: Pext = lower + (sin(Pint) + 1) * (upper - lower) / 2 */
+            scale = get_safe_scale(bounds->scales[i], 1.0, "user");
+        }
+        else if (use_auto_scale && auto_scales)
+        {
+            scale = get_safe_scale(auto_scales[i], 1.0, "auto");
+        }
+
+        /* Check if bound_type exists before accessing it */
+        int bound_type = LM_BOUND_NONE;
+        if (bounds->bound_type)
+        {
+            bound_type = bounds->bound_type[i];
+        }
+
+        if (bound_type == LM_BOUND_BOTH)
+        {
+            /* Case 1: Both bounds - NO scaling */
             double lower = bounds->lower[i];
             double upper = bounds->upper[i];
             pext[i] = lower + (sin(pint[i]) + 1.0) * (upper - lower) / 2.0;
         }
-        else if (bounds->bound_type[i] == LM_BOUND_LOWER)
+        else if (bound_type == LM_BOUND_LOWER)
         {
-            /* Case 2: Pext = lower + scale * (sqrt(Pint^2 + 1) - 1) */
+            /* Case 2: Lower bound only - conditional scaling */
             double lower = bounds->lower[i];
-            double scale = bounds->scales ? bounds->scales[i] : 1.0;
-            pext[i] = lower + scale * (sqrt(pint[i] * pint[i] + 1.0) - 1.0);
+            /* With scale: lower + scale * (sqrt(Pint^2 + 1) - 1) */
+            double temp = pint[i] * pint[i] + 1.0;
+            pext[i] = lower - scale + scale * sqrt(fmax(0.0, temp));
         }
-        else if (bounds->bound_type[i] == LM_BOUND_UPPER)
+        else if (bound_type == LM_BOUND_UPPER)
         {
-            /* Case 3: Pext = upper - scale * (sqrt(Pint^2 + 1) - 1) */
+            /* Case 3: Upper bound only - conditional scaling */
             double upper = bounds->upper[i];
-            double scale = bounds->scales ? bounds->scales[i] : 1.0;
-            pext[i] = upper - scale * (sqrt(pint[i] * pint[i] + 1.0) - 1.0);
+            /* With scale: upper - scale * (sqrt(Pint^2 + 1) - 1) */
+            double temp = pint[i] * pint[i] + 1.0;
+            pext[i] = upper + scale - scale * sqrt(fmax(0.0, temp));
         }
-        else if (bounds->bound_type[i] == LM_BOUND_NONE && bounds->scales)
+        else if (bound_type == LM_BOUND_FIXED)
         {
-            /* Case 4: Pext = Pint * scale */
-            pext[i] = pint[i] * bounds->scales[i];
+            pext[i] = bounds->lower[i]; /* Fixed value */
         }
         else
         {
-            /* No transformation needed */
-            pext[i] = pint[i];
+            /* Case 4: No bounds - apply scaling only if available */
+            pext[i] = pint[i] * scale;
         }
     }
 }
@@ -196,50 +415,108 @@ static void lm_project_to_external(const int n, const double *pint, double *pext
 /* Calculate Jacobian scaling factors for parameter transformation.
    These factors account for the derivative dPext/dPint. */
 static void lm_jacobian_scale_factors(const int n, const double *pint, double *scale_factors,
-                                      const lm_bounds_struct *bounds)
+                                      const lm_bounds_struct *bounds,
+                                      const double *auto_scales,
+                                      int use_auto_scale)
 {
     if (!bounds)
     {
-        /* No bounds, all scale factors are 1.0 */
+        /* No bounds: apply auto scaling if enabled */
         for (int i = 0; i < n; i++)
         {
-            scale_factors[i] = 1.0;
+            if (use_auto_scale && auto_scales)
+            {
+                scale_factors[i] = get_safe_scale(auto_scales[i], 1.0, "auto");
+            }
+            else
+            {
+                scale_factors[i] = 1.0;
+            }
         }
         return;
     }
 
+    /* Check if this is a scales-only bounds (no actual bounds) */
+    if (!bounds->bound_type && bounds->scales)
+    {
+        /* Only user scales, no bounds - apply scaling directly */
+        for (int i = 0; i < n; i++)
+        {
+            scale_factors[i] = get_safe_scale(bounds->scales[i], 1.0, "user");
+        }
+        return;
+    }
+
+    /* Handle cases with actual bounds */
     for (int i = 0; i < n; i++)
     {
+        /* Determine effective scaling factor */
+        double scale = 1.0;
+
+        if (bounds->scales)
+        {
+            scale = get_safe_scale(bounds->scales[i], 1.0, "user");
+        }
+        else if (use_auto_scale && auto_scales)
+        {
+            scale = get_safe_scale(auto_scales[i], 1.0, "auto");
+        }
+
         if (bounds->bound_type[i] == LM_BOUND_BOTH)
         {
-            /* dPext/dPint = (upper - lower) / 2 * cos(Pint) */
+            /* Case 1: Both bounds - NO scaling in derivative */
             double lower = bounds->lower[i];
             double upper = bounds->upper[i];
             scale_factors[i] = (upper - lower) / 2.0 * cos(pint[i]);
         }
         else if (bounds->bound_type[i] == LM_BOUND_LOWER)
         {
-            /* dPext/dPint = scale * Pint / sqrt(Pint^2 + 1) */
-            double scale = bounds->scales ? bounds->scales[i] : 1.0;
+            /* Case 2: Lower bound only - conditional scaling */
             double denominator = sqrt(pint[i] * pint[i] + 1.0);
             scale_factors[i] = scale * pint[i] / denominator;
         }
         else if (bounds->bound_type[i] == LM_BOUND_UPPER)
         {
-            /* dPext/dPint = -scale * Pint / sqrt(Pint^2 + 1) */
-            double scale = bounds->scales ? bounds->scales[i] : 1.0;
+            /* Case 3: Upper bound only - conditional scaling */
             double denominator = sqrt(pint[i] * pint[i] + 1.0);
             scale_factors[i] = -scale * pint[i] / denominator;
         }
-        else if (bounds->bound_type[i] == LM_BOUND_NONE && bounds->scales)
+        else if (bounds->bound_type[i] == LM_BOUND_FIXED)
         {
-            /* dPext/dPint = scale */
-            scale_factors[i] = bounds->scales[i];
+            scale_factors[i] = 0.0;
         }
         else
         {
-            scale_factors[i] = 1.0;
+            /* Case 4: No bounds - return scale if available, otherwise 1.0 */
+            scale_factors[i] = scale;
         }
+    }
+}
+
+/* Scaling priority logic:
+ * 1. C->bounds->scales exists → use user scales, disable auto scaling
+ * 2. C->bounds->scales NULL + C->scale_diag=1 → use auto scaling
+ * 3. C->bounds->scales NULL + C->scale_diag=0 → no scaling (scale=1.0)
+ */
+
+static void determine_scaling_strategy(const lm_control_struct *C,
+                                       int *use_auto_scale,
+                                       const char **scaling_description)
+{
+    if (C->bounds && C->bounds->scales)
+    {
+        *use_auto_scale = 0;
+        *scaling_description = "user-provided scales";
+    }
+    else if (C->scale_diag)
+    {
+        *use_auto_scale = 1;
+        *scaling_description = "auto scaling";
+    }
+    else
+    {
+        *use_auto_scale = 0;
+        *scaling_description = "no scaling";
     }
 }
 
@@ -392,20 +669,25 @@ void lmmin2(
     S->nfev = 0; /* function evaluation counter */
 
     /* Additional variables for bound constraints */
-    double *x_internal = NULL; /* Internal (unconstrained) parameters */
-    double *x_external = NULL; /* External (constrained) parameters */
-    double *jac_scales = NULL; /* Jacobian scaling factors */
+    double *x_internal = NULL;  /* Internal (unconstrained) parameters */
+    double *x_external = NULL;  /* External (constrained) parameters */
+    double *jac_scales = NULL;  /* Jacobian scaling factors */
+    double *auto_scales = NULL; /* Auto-computed scaling factors */
     int has_bounds = (C->bounds != NULL);
 
-    /* Create effective scale_diag value */
-    int scale_diag = C->scale_diag;
-    if (has_bounds && scale_diag)
+    /* Determine effective auto scaling - disabled if user provided scales */
+    int use_auto_scale = C->scale_diag;
+    if (has_bounds && C->bounds->scales)
     {
-        scale_diag = 0;
-        if (C->verbosity)
+        use_auto_scale = 0; /* User provided explicit scales - disable auto scaling */
+        if (C->scale_diag && (C->verbosity & 1))
         {
-            fprintf(msgfile, "Note: scale_diag forced to 0 due to bounds presence\n");
+            fprintf(msgfile, "Note: scale_diag disabled due to user-provided scales\n");
         }
+    }
+    else if (use_auto_scale && (C->verbosity & 1))
+    {
+        fprintf(msgfile, "Auto scaling enabled\n");
     }
 
     /***  Check input parameters for errors.  ***/
@@ -445,29 +727,49 @@ void lmmin2(
         S->outcome = 10;
         return;
     }
-    if (scale_diag != 0 && scale_diag != 1)
+    if (C->scale_diag != 0 && C->scale_diag != 1)
     {
         fprintf(stderr, "lmmin: logical variable scale_diag=%i, "
                         "should be 0 or 1\n",
-                scale_diag);
+                C->scale_diag);
         S->outcome = 10;
         return;
     }
 
+    /* Warn or block if LM_BOUND_BOTH is mixed with other bound types */
+    if (C->bounds && C->bounds->bound_type)
+    {
+        int has_both = 0;
+        int has_other = 0;
+
+        for (int i = 0; i < n; ++i)
+        {
+            int bt = C->bounds->bound_type[i];
+            if (bt == LM_BOUND_BOTH)
+                has_both = 1;
+            else if (bt != LM_BOUND_NONE)
+                has_other = 1;
+        }
+
+        if (has_both && has_other)
+        {
+            fprintf(stderr, "lmmin warning: LM_BOUND_BOTH mixed with other bound types (LOWER/UPPER/NONE). ");
+        }
+    }
     /***  Allocate work space.  ***/
 
     /* Calculate additional workspace needed for bounds */
-    size_t bounds_workspace = 0;
-    if (has_bounds)
+    size_t bounds_workspace = 3 * n * sizeof(double); /* x_external, x_internal, jac_scales */
+    if (use_auto_scale && (!C->bounds || !C->bounds->scales))
     {
-        bounds_workspace = 3 * n * sizeof(double); /* x_internal, x_external, jac_scales */
+        bounds_workspace += 2 * n * sizeof(double); /* auto_scales + prev_acnorm */
     }
 
-    /* Allocate total workspace with just one system call */
+    /* Allocate total workspace */
     char *ws;
     if ((ws = malloc(
              (2 * m + 5 * n + m * n + 3 * n * n) * sizeof(double) +
-             n * sizeof(int) + bounds_workspace)) == NULL) // bounds_workspace 추가
+             n * sizeof(int) + bounds_workspace)) == NULL)
     {
         S->outcome = 9;
         return;
@@ -500,30 +802,40 @@ void lmmin2(
     int *ipvt = (int *)pws;
     pws += n * sizeof(int) / sizeof(char);
 
-    /* Initialize diag */ // TODO: check whether this is still needed
-    if (!scale_diag)
+    /***  Always initialize diag to 1.0  ***/
+    for (j = 0; j < n; j++)
+        diag[j] = 1.0;
+
+    /* Always allocate these workspace segments */
+    x_external = (double *)pws;
+    pws += n * sizeof(double) / sizeof(char);
+    x_internal = (double *)pws;
+    pws += n * sizeof(double) / sizeof(char);
+    jac_scales = (double *)pws;
+    pws += n * sizeof(double) / sizeof(char);
+
+    /* Auto scales and prev_acnorm if needed */
+    double *prev_acnorm = NULL;
+    if (use_auto_scale && (!C->bounds || !C->bounds->scales))
     {
+        auto_scales = (double *)pws;
+        pws += n * sizeof(double) / sizeof(char);
+        prev_acnorm = (double *)pws;
+        pws += n * sizeof(double) / sizeof(char);
+
         for (j = 0; j < n; j++)
-            diag[j] = 1.;
-    }
-
-    /* Assign bounds workspace if needed */
-    if (has_bounds)
-    {
-        x_internal = (double *)pws;
-        pws += n * sizeof(double) / sizeof(char);
-        x_external = (double *)pws;
-        pws += n * sizeof(double) / sizeof(char);
-        jac_scales = (double *)pws;
-        pws += n * sizeof(double) / sizeof(char);
-
-        /* Convert initial external parameters to internal */
-        lm_project_to_internal(n, x, x_internal, C->bounds);
+        {
+            auto_scales[j] = 1.0;
+            prev_acnorm[j] = 0.0;
+        }
     }
     else
     {
-        x_internal = x; /* No bounds, work directly with x */
+        auto_scales = NULL;
     }
+
+    /* Let lm_project_to_internal handle all the logic */
+    lm_project_to_internal(n, x, x_internal, C->bounds, auto_scales, use_auto_scale);
 
     /***  Evaluate function at starting point and calculate norm.  ***/
 
@@ -534,15 +846,8 @@ void lmmin2(
         lm_print_pars(nout, x, msgfile, C->bounds); // Print initial parameters
 
     /* Function evaluation with parameter transformation */
-    if (has_bounds)
-    {
-        lm_project_to_external(n, x_internal, x_external, C->bounds);
-        (*evaluate)(x_external, m, data, fvec, &(S->userbreak));
-    }
-    else
-    {
-        (*evaluate)(x_internal, m, data, fvec, &(S->userbreak));
-    }
+    lm_project_to_external(n, x_internal, x_external, C->bounds, auto_scales, use_auto_scale);
+    (*evaluate)(x_external, m, data, fvec, &(S->userbreak));
 
     if (C->verbosity & 8)
     {
@@ -582,6 +887,37 @@ void lmmin2(
 
     for (int outer = 0;; ++outer)
     {
+        lm_project_to_external(n, x_internal, x_external, C->bounds, auto_scales, use_auto_scale);
+        (*evaluate)(x_external, m, data, fvec, &(S->userbreak));
+        ++(S->nfev);
+        if (S->userbreak)
+            goto terminate;
+
+        /***  [outer]  Update auto scaling from previous iteration  ***/
+        if (outer > 0 && use_auto_scale && auto_scales && (!C->bounds || !C->bounds->scales))
+        {
+            /* Use previous iteration's Jacobian column norms stored in prev_acnorm */
+            for (j = 0; j < n; j++)
+            {
+                double new_scale = prev_acnorm[j]; /* Previous iteration's wa2 */
+                if (isfinite(new_scale) && new_scale > 0.0)
+                {
+                    auto_scales[j] = fmax(auto_scales[j], new_scale);
+                }
+            }
+
+            lm_project_to_internal(n, x_external, x_internal, C->bounds, auto_scales, use_auto_scale);
+
+            if (C->verbosity & 16)
+            {
+                fprintf(msgfile, "Auto scales updated (start of iteration %d): ", outer);
+                for (j = 0; j < nout; j++)
+                {
+                    fprintf(msgfile, "%.3e ", auto_scales[j]);
+                }
+                fprintf(msgfile, "\n");
+            }
+        }
 
         /***  [outer]  Calculate the Jacobian.  ***/
 
@@ -592,15 +928,8 @@ void lmmin2(
 
             /* Central difference calculation */
             x_internal[j] = temp + step;
-            if (has_bounds)
-            {
-                lm_project_to_external(n, x_internal, x_external, C->bounds);
-                (*evaluate)(x_external, m, data, wf, &(S->userbreak));
-            }
-            else
-            {
-                (*evaluate)(x_internal, m, data, wf, &(S->userbreak));
-            }
+            lm_project_to_external(n, x_internal, x_external, C->bounds, auto_scales, use_auto_scale);
+            (*evaluate)(x_external, m, data, wf, &(S->userbreak));
             ++(S->nfev);
             if (S->userbreak)
                 goto terminate;
@@ -608,62 +937,25 @@ void lmmin2(
                 wa1[i] = wf[i]; /* Store f(x+h) */
 
             x_internal[j] = temp - step;
-            if (has_bounds)
-            {
-                lm_project_to_external(n, x_internal, x_external, C->bounds);
-                (*evaluate)(x_external, m, data, wf, &(S->userbreak));
-            }
-            else
-            {
-                (*evaluate)(x_internal, m, data, wf, &(S->userbreak));
-            }
+            lm_project_to_external(n, x_internal, x_external, C->bounds, auto_scales, use_auto_scale);
+            (*evaluate)(x_external, m, data, wf, &(S->userbreak));
             ++(S->nfev);
             if (S->userbreak)
                 goto terminate;
-
             for (i = 0; i < m; i++)
                 fjac[j * m + i] = (wa1[i] - wf[i]) / (2 * step);
 
             x_internal[j] = temp; /* restore */
         }
 
-        /* Apply Jacobian scaling for bound constraints */
-        if (has_bounds)
-        {
-            lm_jacobian_scale_factors(n, x_internal, jac_scales, C->bounds);
-            for (j = 0; j < n; j++)
-            {
-                for (i = 0; i < m; i++)
-                {
-                    fjac[j * m + i] *= jac_scales[j];
-                }
-            }
-        }
+        /***  Apply enhanced Jacobian scaling  ***/
 
-        /* Calculate fvec at the current x_internal */
-        if (has_bounds)
+        lm_jacobian_scale_factors(n, x_internal, jac_scales, C->bounds, auto_scales, use_auto_scale);
+        for (j = 0; j < n; j++)
         {
-            lm_project_to_external(n, x_internal, x_external, C->bounds);
-            (*evaluate)(x_external, m, data, fvec, &(S->userbreak));
-        }
-        else
-        {
-            (*evaluate)(x_internal, m, data, fvec, &(S->userbreak));
-        }
-        ++(S->nfev);
-        if (S->userbreak)
-            goto terminate;
-
-        if (C->verbosity & 16)
-        {
-            /* print the entire matrix */
-            fprintf(msgfile, "Jacobian\n");
             for (i = 0; i < m; i++)
             {
-                fprintf(msgfile, "  ");
-                for (j = 0; j < n; j++)
-                    fprintf(msgfile, "%.5e ", fjac[j * m + i]);
-                fprintf(msgfile, "\n");
+                fjac[j * m + i] *= jac_scales[j];
             }
         }
 
@@ -691,6 +983,12 @@ void lmmin2(
 
         lm_qrfac(m, n, fjac, ipvt, wa1, wa2, wa3);
         /* return values are ipvt, wa1=rdiag, wa2=acnorm */
+
+        /***  [outer]  Store current acnorm for next iteration  ***/
+        if (use_auto_scale && auto_scales && prev_acnorm && (!C->bounds || !C->bounds->scales))
+        {
+            memcpy(prev_acnorm, wa2, n * sizeof(double)); /* Store for next iteration */
+        }
 
         /***  [outer]  Form Q^T * fvec, and store first n components in qtf.  ***/
 
@@ -741,28 +1039,7 @@ void lmmin2(
         if (!outer)
         {
             /* first iteration only */
-            if (scale_diag)
-            {
-                /* diag := norms of the columns of the initial Jacobian (MINPACK style) */
-                for (j = 0; j < n; j++)
-                {
-                    diag[j] = wa2[j]; /* wa2 contains column norms from qrfac */
-                    if (diag[j] == 0.0)
-                    {
-                        diag[j] = 1.0; /* MINPACK: use 1.0 for zero columns */
-                    }
-                }
-
-                /* xnorm := || D x || (scaled parameter norm) */
-                for (j = 0; j < n; j++)
-                    wa3[j] = diag[j] * x_internal[j];
-                xnorm = lm_enorm(n, wa3);
-            }
-            else
-            {
-                /* mode != 2: use unscaled parameter norm */
-                xnorm = lm_enorm(n, x_internal);
-            }
+            xnorm = lm_enorm(n, x_internal);
 
             if (!isfinite(xnorm))
             {
@@ -790,23 +1067,11 @@ void lmmin2(
                 fprintf(msgfile, "\n");
             }
         }
-        else
-        {
-            /* subsequent iterations: rescale if necessary (MINPACK style) */
-            if (scale_diag)
-            {
-                for (j = 0; j < n; j++)
-                {
-                    diag[j] = fmax(diag[j], wa2[j]); /* keep the larger scaling factor */
-                }
-            }
-        }
 
         /***  The inner loop. ***/
         int inner = 0;
         do
         {
-
             /***  [inner]  Determine the Levenberg-Marquardt parameter.  ***/
 
             lm_lmpar(n, fjac, m, ipvt, diag, qtf, delta, &lmpar,
@@ -850,18 +1115,12 @@ void lmmin2(
                 wa2[j] = x_internal[j] - wa1[j];
 
             /* Function evaluation with bounds handling */
-            if (has_bounds)
-            {
-                lm_project_to_external(n, wa2, x_external, C->bounds);
-                (*evaluate)(x_external, m, data, wf, &(S->userbreak));
-            }
-            else
-            {
-                (*evaluate)(wa2, m, data, wf, &(S->userbreak));
-            }
+            lm_project_to_external(n, wa2, x_external, C->bounds, auto_scales, use_auto_scale);
+            (*evaluate)(x_external, m, data, wf, &(S->userbreak));
             ++(S->nfev);
             if (S->userbreak)
                 goto terminate;
+
             fnorm1 = lm_fnorm(m, wf, y);
 
             // exceptionally, for this norm we do not test for infinity
@@ -896,21 +1155,12 @@ void lmmin2(
                         dirder, delta, pnorm, fnorm1);
 
                 /* Print external parameters for user readability */
-                if (has_bounds)
-                {
-                    /* Convert wa2 (internal parameters) to external for display */
-                    /* Temporarily use wa3 as workspace for external parameters */
-                    lm_project_to_external(nout, wa2, wa3, C->bounds);
-                    for (i = 0; i < nout; ++i)
-                        fprintf(msgfile, " %16.9g", wa3[i]);
-                    /* wa3 will be overwritten later, so this is safe */
-                }
-                else
-                {
-                    /* No bounds, wa2 is already external */
-                    for (i = 0; i < nout; ++i)
-                        fprintf(msgfile, " %16.9g", wa2[i]);
-                }
+                /* Convert wa2 (internal parameters) to external for display */
+                /* Temporarily use wa3 as workspace for external parameters */
+                lm_project_to_external(nout, wa2, wa3, C->bounds, auto_scales, use_auto_scale);
+                for (i = 0; i < nout; ++i)
+                    fprintf(msgfile, " %16.9g", wa3[i]);
+                /* wa3 will be overwritten later, so this is safe */
 
                 fprintf(msgfile, "\n");
             }
@@ -969,19 +1219,8 @@ void lmmin2(
             if (inner_success)
             {
                 /* Update internal parameters */
-                if (scale_diag)
-                {
-                    for (j = 0; j < n; j++)
-                    {
-                        x_internal[j] = wa2[j];
-                        wa2[j] = diag[j] * x_internal[j];
-                    }
-                }
-                else
-                {
-                    for (j = 0; j < n; j++)
-                        x_internal[j] = wa2[j];
-                }
+                for (j = 0; j < n; j++)
+                    x_internal[j] = wa2[j];
 
                 for (i = 0; i < m; i++)
                     fvec[i] = wf[i];
@@ -1058,10 +1297,7 @@ void lmmin2(
 terminate:
 
     /***  Convert final internal parameters back to external  ***/
-    if (has_bounds)
-    {
-        lm_project_to_external(n, x_internal, x, C->bounds);
-    }
+    lm_project_to_external(n, x_internal, x, C->bounds, auto_scales, use_auto_scale);
 
     /***  Set status.  ***/
     S->fnorm = lm_fnorm(m, fvec, y);
@@ -1081,15 +1317,8 @@ terminate:
             x_internal[j] += step; /* replace temporarily */
 
             /* Function evaluation with bounds handling */
-            if (has_bounds)
-            {
-                lm_project_to_external(n, x_internal, x_external, C->bounds);
-                (*evaluate)(x_external, m, data, wf, &failure);
-            }
-            else
-            {
-                (*evaluate)(x_internal, m, data, wf, &failure);
-            }
+            lm_project_to_external(n, x_internal, x_external, C->bounds, auto_scales, use_auto_scale);
+            (*evaluate)(x_external, m, data, wf, &failure);
 
             if (failure)
                 goto no_error_estimate;

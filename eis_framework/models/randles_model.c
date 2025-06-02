@@ -334,7 +334,7 @@ void test_initial_guess_sensitivity()
         params->values[PARAM_CDL] = initial_guesses[test][2];
 
         FittingContext *ctx = create_fitting_context(data, randles_model, params);
-        set_weighting_method(ctx, WEIGHT_MODULUS_AUTO);
+        set_weighting_method(ctx, WEIGHT_MODULUS_MEAS);
 
         lm_control_struct control = lm_control_double;
         control.stepbound = 1.0;
