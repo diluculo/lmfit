@@ -1,8 +1,6 @@
 ﻿#include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
-#include <errno.h>
-#include <string.h>
 #include "lmmin.h"
 
 #define N 70
@@ -15,103 +13,76 @@ typedef struct
     double imag;
 } Complex;
 
-/* --- Basic complex arithmetic --- */
-
-static inline Complex c_add(Complex a, Complex b)
-{
-    return (Complex){a.real + b.real, a.imag + b.imag};
-}
-
-static inline Complex c_sub(Complex a, Complex b)
-{
-    return (Complex){a.real - b.real, a.imag - b.imag};
-}
-
-static inline Complex c_mul(Complex a, Complex b)
-{
-    return (Complex){
-        a.real * b.real - a.imag * b.imag,
-        a.real * b.imag + a.imag * b.real};
-}
-
-static inline Complex c_mul_scalar(Complex a, double b)
-{
-    return (Complex){a.real * b, a.imag * b};
-}
-
-static inline Complex c_div(Complex a, Complex b)
-{
-    double denom = b.real * b.real + b.imag * b.imag;
-    return (Complex){
-        (a.real * b.real + a.imag * b.imag) / denom,
-        (a.imag * b.real - a.real * b.imag) / denom};
-}
-
-static inline Complex c_inv(Complex a)
-{
-    double denom = a.real * a.real + a.imag * a.imag;
-    return (Complex){a.real / denom, -a.imag / denom};
-}
-
-/* --- Complex impedance compositions --- */
-
-static inline Complex z_ser(Complex z1, Complex z2)
-{
-    return c_add(z1, z2);
-}
-
-static inline Complex z_ser_array(int count, const Complex *z)
-{
-    Complex sum = {0.0, 0.0};
-    for (int i = 0; i < count; ++i)
-        sum = z_ser(sum, z[i]);
-    return sum;
-}
-
-static inline Complex z_par(Complex z1, Complex z2)
-{
-    return c_inv(c_add(c_inv(z1), c_inv(z2)));
-}
-
-/* --- Component models --- */
-
-// Resistor: R → Z = R
-static inline Complex resistor(double R)
-{
-    return (Complex){R, 0.0};
-}
-
-// Capacitor: C → Z = -j / (ωC)
-static inline Complex capacitor(double C, double omega)
-{
-    return (Complex){0.0, -1.0 / (omega * C)};
-}
-
 /* --- Simple Randles circuit parameters --- */
 typedef struct
 {
     double Rs, Rct, Cdl;
 } Params;
 
-/* --- Frequency and measured data --- */
-
+/* --- Global data arrays --- */
 static double frequencies[N];
 static Complex impedances[N];
 
+/* Weighting method enumeration */
+typedef enum
+{
+    WEIGHT_UNITY = 0,         /* No weighting (unit weights) */
+    WEIGHT_MODULUS_MEAS,      /* Weight by 1/|Z_measured| */
+    WEIGHT_PROPORTIONAL_MEAS, /* Weight by 1/|Re|, 1/|Im| separately */
+    WEIGHT_MODULUS_FIT,       /* Weight by 1/|Z_fitted| */
+    WEIGHT_PROPORTIONAL_FIT,  /* Weight by 1/|Re_fit|, 1/|Im_fit| separately */
+} WeightingMethod;
+
+/* Global weighting state */
+static WeightingMethod current_weighting = WEIGHT_UNITY; /* Default to no weighting */
+
+/* --- Model functions --- */
 Complex model_impedance(double frequency, const Params *p)
 {
+    double Rs = p->Rs;
+    double Rct = p->Rct;
+    double Cdl = p->Cdl;
+
     double w = 2 * PI * frequency;
+    double omega_tau = Rct * Cdl * w;
+    double denom = 1.0 + omega_tau * omega_tau;
 
-    Complex Z_Rs = resistor(p->Rs);
-    Complex Z_Rct = resistor(p->Rct);
-    Complex Z_Cdl = capacitor(p->Cdl, w);
+    // Real part: Z_real = Rs + Rct / (1 + (Rct * Cdl * ω)²)
+    double z_real = Rs + Rct / denom;
 
-    /* Rs in series with (Rct || Cdl) */
-    Complex Z_rc = z_par(Z_Rct, Z_Cdl);
-    return z_ser(Z_Rs, Z_rc);
+    // Imaginary part: Z_imag = -Rct² * Cdl * ω / (1 + (Rct * Cdl * ω)²)
+    double z_imag = -Rct * Rct * Cdl * w / denom;
+
+    return (Complex){z_real, z_imag};
+}
+void model_derivatives(double frequency, const Params *p, Complex *prime)
+{
+    double Rs = p->Rs;
+    double Rct = p->Rct;
+    double Cdl = p->Cdl;
+
+    double w = 2 * PI * frequency;
+    double omega_tau = Rct * Cdl * w;
+    double omega_tau_sq = omega_tau * omega_tau;
+    double denom = 1.0 + omega_tau_sq;
+    double denom_sq = denom * denom;
+
+    // ∂Z/∂Rs = 1 + 0j
+    prime[0] = (Complex){1.0, 0.0};
+
+    // ∂Z/∂Rct = (1 - (w Cdl)^2 Rct^2) / (1 + (w Rct Cdl)^2)^2 - j (2w Rct Cdl)/(1 + (w Rct Cdl)^2)^2
+    double cdl_w_sq = Cdl * Cdl * w * w;
+    prime[1] = (Complex){
+        (1.0 - cdl_w_sq * Rct * Rct) / denom_sq,
+        -2.0 * Rct * Cdl * w / denom_sq};
+
+    // ∂Z/∂Cdl = -2 Rct Cdl w^2 / (1 + (w Rct Cdl)^2)^2 - j (Rct^2 ω) / (1 + (w Rct Cdl)^2)^2
+    prime[2] = (Complex){
+        -2.0 * Rct * Cdl * w * w / denom_sq,
+        -Rct * Rct * w / denom_sq};
 }
 
-/* --- Generate ideal Randles circuit data --- */
+/* --- Data generation --- */
 static void generate_randles_simulation_data(void)
 {
     /* True parameter values */
@@ -132,9 +103,6 @@ static void generate_randles_simulation_data(void)
     double log_freq_min = log10(freq_min);
     double log_freq_max = log10(freq_max);
 
-    // Seed random number generator for reproducible noise
-    srand(12345);
-
     for (int i = 0; i < N; i++)
     {
         /* Logarithmic frequency spacing */
@@ -143,56 +111,14 @@ static void generate_randles_simulation_data(void)
 
         /* Calculate ideal impedance */
         impedances[i] = model_impedance(frequencies[i], &true_params);
-
-        // /* Add small amount of noise (0.1% of magnitude) */
-        // double noise_level = 0.001; /* 0.1% noise */
-        // double mag = sqrt(impedances[i].real * impedances[i].real +
-        //                   impedances[i].imag * impedances[i].imag);
-
-        // /* Generate random noise */
-        // double noise_real = ((double)rand() / RAND_MAX - 0.5) * 2 * noise_level * mag;
-        // double noise_imag = ((double)rand() / RAND_MAX - 0.5) * 2 * noise_level * mag;
-
-        // impedances[i].real += noise_real;
-        // impedances[i].imag += noise_imag;
-
-        // Print first few and last few points
-        // if (i < 3 || i >= N - 3)
-        // {
-        //     printf("f[%2d] = %8.2e Hz, Z = %8.2f %+8.2fi ohm\n",
-        //            i, frequencies[i], impedances[i].real, impedances[i].imag);
-        // }
-        // else if (i == 3)
-        // {
-        //     printf("...\n");
-        // }
     }
     printf("\nData generation complete.\n\n");
 }
 
 /* --- Weighting system --- */
-
-/* Weighting method enumeration */
-typedef enum
-{
-    WEIGHT_UNITY = 0,         /* No weighting (unit weights) */
-    WEIGHT_MODULUS_MEAS,      /* Weight by 1/|Z_measured| */
-    WEIGHT_PROPORTIONAL_MEAS, /* Weight by 1/|Re|, 1/|Im| separately */
-    WEIGHT_MODULUS_FIT,       /* Weight by 1/|Z_fitted| */
-    WEIGHT_PROPORTIONAL_FIT,  /* Weight by 1/|Re_fit|, 1/|Im_fit| separately */
-    WEIGHT_MODULUS_AUTO,      /* Start with measured, then use fitted */
-    WEIGHT_PROPORTIONAL_AUTO  /* Start with measured proportional, then use fitted */
-} WeightingMethod;
-
-/* Global weighting method and state */
-static WeightingMethod current_weighting = WEIGHT_UNITY; /* Default to no weighting */
-static int evaluation_count = 0;                         /* Track evaluations for auto modes */
-
-/* Function to set weighting method */
 void set_weighting_method(WeightingMethod method)
 {
     current_weighting = method;
-    evaluation_count = 0; /* Reset counter when method changes */
 
     const char *method_names[] = {
         "Unity (no weighting)",
@@ -205,24 +131,11 @@ void set_weighting_method(WeightingMethod method)
 
     printf("Weighting method set to: %s\n", method_names[method]);
 }
-
-/* Calculate weighting factors for real and imaginary parts separately */
 static void calculate_weights(Complex z_measured, Complex z_fitted,
                               int use_measured_for_auto,
                               double *weight_real, double *weight_imag)
 {
-    /* For auto modes, decide which data to use */
-    WeightingMethod effective_method = current_weighting;
-    if (current_weighting == WEIGHT_MODULUS_AUTO)
-    {
-        effective_method = use_measured_for_auto ? WEIGHT_MODULUS_MEAS : WEIGHT_MODULUS_FIT;
-    }
-    else if (current_weighting == WEIGHT_PROPORTIONAL_AUTO)
-    {
-        effective_method = use_measured_for_auto ? WEIGHT_PROPORTIONAL_MEAS : WEIGHT_PROPORTIONAL_FIT;
-    }
-
-    switch (effective_method)
+    switch (current_weighting)
     {
     case WEIGHT_UNITY:
         *weight_real = 1.0;
@@ -280,20 +193,12 @@ static void calculate_weights(Complex z_measured, Complex z_fitted,
     }
 }
 
-/* --- Residual function for lmmin --- */
-
+/* --- Optimization functions --- */
 void evaluate_residuals(const double *par, int m_dat, const void *data, double *fvec, int *info)
 {
     (void)info;
     (void)data;
     (void)m_dat;
-
-    evaluation_count++;
-
-    /* For auto modes: use measured data for first few evaluations, then switch to fitted */
-    int use_measured_for_auto = (evaluation_count <= 3) &&
-                                (current_weighting == WEIGHT_MODULUS_AUTO ||
-                                 current_weighting == WEIGHT_PROPORTIONAL_AUTO);
 
     // Simple 3-parameter Randles model
     Params p = {
@@ -308,7 +213,7 @@ void evaluate_residuals(const double *par, int m_dat, const void *data, double *
 
         /* Calculate separate weighting factors for real and imaginary parts */
         double weight_real, weight_imag;
-        calculate_weights(z_measured, z_fitted, use_measured_for_auto,
+        calculate_weights(z_measured, z_fitted, current_weighting,
                           &weight_real, &weight_imag);
 
         /* Apply weighted residuals */
@@ -316,8 +221,44 @@ void evaluate_residuals(const double *par, int m_dat, const void *data, double *
         fvec[i + N] = weight_imag * (z_fitted.imag - z_measured.imag); /* Imaginary part */
     }
 }
+void evaluate_jacobian(const double *par, int m_dat, const void *data,
+                       double *fjac, int *info)
+{
+    (void)info;
+    (void)data;
+    (void)m_dat;
 
-/* Function to calculate chi-squared with current weighting */
+    // Simple 3-parameter Randles model
+    Params p = {
+        .Rs = par[0],
+        .Rct = par[1],
+        .Cdl = par[2]};
+
+    for (int i = 0; i < N; ++i)
+    {
+        Complex z_fitted = model_impedance(frequencies[i], &p);
+        Complex z_measured = impedances[i];
+
+        /* Calculate model derivatives */
+        Complex derivatives[3];
+        model_derivatives(frequencies[i], &p, derivatives);
+
+        /* Calculate separate weighting factors for real and imaginary parts */
+        double weight_real, weight_imag;
+        calculate_weights(z_measured, z_fitted, current_weighting,
+                          &weight_real, &weight_imag);
+
+        /* Jacobian for real part residual (row i) */
+        fjac[0 * m_dat + i] = weight_real * derivatives[0].real; /* ∂residual_real/∂Rs */
+        fjac[1 * m_dat + i] = weight_real * derivatives[1].real; /* ∂residual_real/∂Rct */
+        fjac[2 * m_dat + i] = weight_real * derivatives[2].real; /* ∂residual_real/∂Cdl */
+
+        /* Jacobian for imaginary part residual (row i+N) */
+        fjac[0 * m_dat + i + N] = weight_imag * derivatives[0].imag; /* ∂residual_imag/∂Rs */
+        fjac[1 * m_dat + i + N] = weight_imag * derivatives[1].imag; /* ∂residual_imag/∂Rct */
+        fjac[2 * m_dat + i + N] = weight_imag * derivatives[2].imag; /* ∂residual_imag/∂Cdl */
+    }
+}
 double calculate_chi_squared(const double *par)
 {
     Params p = {par[0], par[1], par[2]};
@@ -341,7 +282,7 @@ double calculate_chi_squared(const double *par)
     return chi_sq;
 }
 
-/* --- Setup bounds for 3 parameters (Rs, Rct, Cdl) --- */
+/* --- Bounds management --- */
 lm_bounds_struct *setup_bounds(int n_par, lm_bound_type bound_type, int use_user_scales)
 {
     if (n_par <= 0)
@@ -450,7 +391,6 @@ lm_bounds_struct *setup_bounds(int n_par, lm_bound_type bound_type, int use_user
 
     return bounds;
 }
-
 void cleanup_bounds(lm_bounds_struct *bounds)
 {
     if (bounds)
@@ -463,113 +403,7 @@ void cleanup_bounds(lm_bounds_struct *bounds)
     }
 }
 
-/* Function to print detailed frequency-by-frequency comparison */
-void print_frequency_comparison(const double *par)
-{
-    Params p = {par[0], par[1], par[2]};
-
-    printf("\nFrequency comparison (Magnitude & Phase):\n");
-    printf(" Freq [Hz]   |Z_meas|      Phase_meas   |Z_fit|       Phase_fit    |Z|_Error%%  Phase_Error\n");
-    printf("-----------  ------------  -----------  ------------  -----------  ----------  -----------\n");
-
-    double total_mag_error = 0.0;
-    double total_phase_error = 0.0;
-
-    for (int i = 0; i < N; ++i)
-    {
-        Complex z_fitted = model_impedance(frequencies[i], &p);
-        Complex z_measured = impedances[i];
-
-        /* Calculate magnitude and phase */
-        double mag_meas = sqrt(z_measured.real * z_measured.real + z_measured.imag * z_measured.imag);
-        double phase_meas = atan2(z_measured.imag, z_measured.real) * 180.0 / PI;
-
-        double mag_fit = sqrt(z_fitted.real * z_fitted.real + z_fitted.imag * z_fitted.imag);
-        double phase_fit = atan2(z_fitted.imag, z_fitted.real) * 180.0 / PI;
-
-        /* Calculate errors */
-        double mag_error_pct = 100.0 * (mag_fit - mag_meas) / mag_meas;
-        double phase_error = phase_fit - phase_meas;
-
-        /* Handle phase wraparound */
-        if (phase_error > 180.0)
-            phase_error -= 360.0;
-        if (phase_error < -180.0)
-            phase_error += 360.0;
-
-        printf("%11.3f  %9.6e  %11.2f  %9.6e  %11.2f  %10.2f  %11.2f\n",
-               frequencies[i], mag_meas, phase_meas, mag_fit, phase_fit,
-               mag_error_pct, phase_error);
-
-        /* Accumulate absolute errors for summary */
-        total_mag_error += fabs(mag_error_pct);
-        total_phase_error += fabs(phase_error);
-    }
-
-    printf("-----------  ------------  -----------  ------------  -----------  ----------  -----------\n");
-    printf("Average absolute error:                                            %10.2f  %11.2f\n",
-           total_mag_error / N, total_phase_error / N);
-}
-
-/* Function to test different weighting methods */
-void test_weighting_methods(const double *initial_par, lm_bounds_struct *bounds, double step_bound, int use_auto_scales)
-{
-    const int n_par = 3;
-    const char *param_names[] = {"Rs", "Rct", "Cdl"};
-
-    WeightingMethod methods[] = {
-        WEIGHT_UNITY,
-        WEIGHT_MODULUS_MEAS,
-        WEIGHT_PROPORTIONAL_MEAS,
-        WEIGHT_MODULUS_FIT,
-        WEIGHT_PROPORTIONAL_FIT};
-
-    const char *method_names[] = {
-        "Unity",
-        "Modulus Measured",
-        "Proportional Measured",
-        "Modulus Fitted",
-        "Proportional Fitted"};
-
-    int num_methods = sizeof(methods) / sizeof(methods[0]);
-
-    printf("\n=== Testing Different Weighting Methods ===\n");
-
-    for (int m = 0; m < num_methods; m++)
-    {
-        printf("\n--- %i. Testing %s Weighting ---\n", m + 1, method_names[m]);
-
-        // Reset parameters to initial guess
-        double par[3] = {initial_par[0], initial_par[1], initial_par[2]};
-        evaluation_count = 0;
-
-        set_weighting_method(methods[m]);
-
-        printf("Initial parameters:\n");
-        for (int i = 0; i < n_par; ++i)
-            printf("  %-6s = %.10g\n", param_names[i], initial_par[i]);
-
-        double chi_sq = calculate_chi_squared(par);
-        printf("initial fnorm: %.6e\n\n", sqrt(chi_sq));
-
-        /* Setup control structure */
-        lm_control_struct control = lm_control_double;
-        control.stepbound = step_bound;
-        control.patience = 1000;
-        control.scale_diag = use_auto_scales;
-        control.bounds = bounds;
-        control.verbosity = 1; // Reduced verbosity for comparison
-
-        control.ftol = 1e-12;
-        control.xtol = 1e-12;
-        control.gtol = 1e-12;
-
-        lm_status_struct status;
-        lmmin2(n_par, par, NULL, NULL, 2 * N, NULL, NULL, evaluate_residuals, &control, &status);
-    }
-}
-
-/* Function to test different bound types and scaling combinations */
+/* --- Testing functions --- */
 void test_all_configurations(const double *initial_par)
 {
     const int n_par = 3;
@@ -612,90 +446,104 @@ void test_all_configurations(const double *initial_par)
     int num_configs = sizeof(configs) / sizeof(configs[0]);
     int num_methods = sizeof(methods) / sizeof(methods[0]);
 
-    printf("\n=== Testing All Configurations ===\n");
-    printf("True parameters:    Rs=10.0, Rct=100.0, Cdl=1e-06\n");
-    printf("Initial parameters: Rs=1,    Rct=1,     Cdl=1\n\n");
+    /* Test both Jacobian types */
+    const char *jacobian_types[] = {"Numerical", "Analytical"};
 
-    /* Results summary table */
-    printf("Configuration                          | Weighting Method      | chi2_reduced  | Rs         | Rct        | Cdl        | Outcome\n");
-    printf("---------------------------------------|-----------------------|---------------|------------|------------|------------|------------------\n");
-
-    for (int c = 0; c < num_configs; c++)
+    for (int jac_type = 0; jac_type < 2; jac_type++)
     {
-        /* Setup bounds for current configuration */
-        lm_bounds_struct *bounds = setup_bounds(n_par, configs[c].bound_type, configs[c].use_user_scales);
-        if (!bounds)
-        {
-            printf("Error: Failed to allocate bounds for config %d\n", c);
-            continue;
-        }
+        printf("\n=== Testing All Configurations with %s Jacobian ===\n", jacobian_types[jac_type]);
+        printf("True parameters:    Rs=10.0, Rct=100.0, Cdl=1e-06\n");
+        printf("Initial parameters: Rs=1,    Rct=1,     Cdl=1\n\n");
 
-        for (int m = 0; m < num_methods; m++)
-        {
-            /* Reset parameters to initial guess */
-            double par[3] = {initial_par[0], initial_par[1], initial_par[2]};
-            double par_errors[3] = {0};
-            double covar[9] = {0}; /* 3x3 covariance matrix */
-
-            evaluation_count = 0;
-
-            /* Set weighting method */
-            current_weighting = methods[m];
-
-            /* Setup control structure */
-            lm_control_struct control = lm_control_double;
-            control.stepbound = configs[c].step_bound;
-            control.patience = 1000;
-            control.scale_diag = configs[c].use_auto_scales;
-            control.bounds = bounds;
-            control.verbosity = 0; // Silent for summary table
-
-            control.ftol = 1e-12;
-            control.xtol = 1e-12;
-            control.gtol = 1e-12;
-
-            /* Run optimization */
-            lm_status_struct status;
-            lmmin2(n_par, par, par_errors, covar, 2 * N, NULL, NULL, evaluate_residuals, &control, &status);
-
-            /* Calculate degrees of freedom and reduced chi-squared */
-            int fixed_params = 0;
-            for (int i = 0; i < n_par; i++)
-            {
-                if (!bounds->bound_type || bounds->bound_type[i] != LM_BOUND_FIXED)
-                {
-                    fixed_params++;
-                }
-            }
-            int dof = 2 * N - fixed_params;
-            double chi2_reduced = (dof > 0) ? (status.fnorm * status.fnorm) / dof : 0.0;
-
-            /* Print summary row */
-            printf("%-38s | %-21s | %13.6e | %10.4g | %10.4g | %10.4g | %s\n",
-                   configs[c].config_name,
-                   method_names[m],
-                   chi2_reduced,
-                   par[0], par[1], par[2],
-                   lm_shortmsg[status.outcome]);
-
-            /* Print standard errors row */
-            printf("%-38s | %-21s | %-13s | %10.4g | %10.4g | %10.4g | %s\n",
-                   "",
-                   "(std errors)",
-                   "",
-                   par_errors[0], par_errors[1], par_errors[2],
-                   "");
-        }
-
-        cleanup_bounds(bounds);
+        /* Results summary table */
+        printf("Configuration                          | Weighting Method      | chi2_reduced  | Rs         | Rct        | Cdl        | Outcome\n");
         printf("---------------------------------------|-----------------------|---------------|------------|------------|------------|------------------\n");
-    }
 
-    printf("\nLegend:\n");
-    printf("  NONE: No bounds (unbounded optimization)\n");
-    printf("  BOTH: Both lower and upper bounds [1e-8, 1e+8]\n");
-    printf("  LOG:  Logarithmic transformation (always positive)\n");
-    printf("  step: stepbound parameter for trust region\n\n");
+        for (int c = 0; c < num_configs; c++)
+        {
+            /* Setup bounds for current configuration */
+            lm_bounds_struct *bounds = setup_bounds(n_par, configs[c].bound_type, configs[c].use_user_scales);
+            if (!bounds)
+            {
+                printf("Error: Failed to allocate bounds for config %d\n", c);
+                continue;
+            }
+
+            for (int m = 0; m < num_methods; m++)
+            {
+                /* Reset parameters to initial guess */
+                double par[3] = {initial_par[0], initial_par[1], initial_par[2]};
+                double par_errors[3] = {0};
+                double covar[9] = {0}; /* 3x3 covariance matrix */
+
+                /* Set weighting method */
+                current_weighting = methods[m];
+
+                /* Setup control structure */
+                lm_control_struct control = lm_control_double;
+                control.stepbound = configs[c].step_bound;
+                control.patience = 1000;
+                control.scale_diag = configs[c].use_auto_scales;
+                control.bounds = bounds;
+                control.verbosity = 0; // Silent for summary table
+
+                /* Set Jacobian type */
+                if (jac_type == 0)
+                {
+                    control.jacobian = NULL; /* Numerical Jacobian */
+                }
+                else
+                {
+                    control.jacobian = evaluate_jacobian; /* Analytical Jacobian */
+                }
+
+                control.ftol = 1e-12;
+                control.xtol = 1e-12;
+                control.gtol = 1e-12;
+
+                /* Run optimization */
+                lm_status_struct status;
+                lmmin2(n_par, par, par_errors, covar, 2 * N, NULL, NULL, evaluate_residuals, &control, &status);
+
+                /* Calculate degrees of freedom and reduced chi-squared */
+                int fixed_params = 0;
+                for (int i = 0; i < n_par; i++)
+                {
+                    if (!bounds->bound_type || bounds->bound_type[i] != LM_BOUND_FIXED)
+                    {
+                        fixed_params++;
+                    }
+                }
+                int dof = 2 * N - fixed_params;
+                double chi2_reduced = (dof > 0) ? (status.fnorm * status.fnorm) / dof : 0.0;
+
+                /* Print summary row */
+                printf("%-38s | %-21s | %13.6e | %10.4g | %10.4g | %10.4g | %s\n",
+                       configs[c].config_name,
+                       method_names[m],
+                       chi2_reduced,
+                       par[0], par[1], par[2],
+                       lm_shortmsg[status.outcome]);
+
+                /* Print standard errors row */
+                printf("%-38s | %-21s | %-13s | %10.4g | %10.4g | %10.4g | %s\n",
+                       "",
+                       "(std errors)",
+                       "",
+                       par_errors[0], par_errors[1], par_errors[2],
+                       "");
+            }
+
+            cleanup_bounds(bounds);
+            printf("---------------------------------------|-----------------------|---------------|------------|------------|------------|------------------\n");
+        }
+
+        printf("\nLegend:\n");
+        printf("  NONE: No bounds (unbounded optimization)\n");
+        printf("  BOTH: Both lower and upper bounds [1e-8, 1e+8]\n");
+        printf("  LOG:  Logarithmic transformation (always positive)\n");
+        printf("  step: stepbound parameter for trust region\n\n");
+    }
 }
 
 /* --- Main function --- */

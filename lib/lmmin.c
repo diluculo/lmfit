@@ -451,6 +451,140 @@ static void determine_scaling_strategy(const lm_control_struct *C,
 }
 
 /*****************************************************************************/
+/*  Jacobian computation functions                                           */
+/*****************************************************************************/
+
+static void lm_compute_numerical_jacobian(
+    const int n, const int m, const double *const x_external,
+    const void *const data,
+    void (*const evaluate)(
+        const double *const par, const int m_dat, const void *const data,
+        double *const fvec, int *const userbreak),
+    double *const fjac, double *const wf,
+    const lm_bounds_struct *bounds, int *const userbreak, int *const nfev)
+{
+    int i, j;
+    double temp, step;
+    double *x_temp = malloc(n * sizeof(double));
+
+    if (!x_temp)
+    {
+        *userbreak = 1;
+        return;
+    }
+
+    for (j = 0; j < n; j++)
+    {
+        /* Check if this parameter is FIXED */
+        int is_fixed = 0;
+        if (bounds && bounds->bound_type && bounds->bound_type[j] == LM_BOUND_FIXED)
+        {
+            is_fixed = 1;
+        }
+
+        if (is_fixed)
+        {
+            /* For FIXED parameters, set Jacobian column to zero */
+            for (i = 0; i < m; i++)
+                fjac[j * m + i] = 0.0;
+        }
+        else
+        {
+            temp = x_external[j];
+            step = calculate_step_size(temp, 1); /* Use optimal step size */
+
+            /* Copy parameters for modification */
+            memcpy(x_temp, x_external, n * sizeof(double));
+
+            /* Calculate f(x + h) */
+            x_temp[j] = temp + step;
+            (*evaluate)(x_temp, m, data, wf, userbreak);
+            (*nfev)++;
+            if (*userbreak)
+            {
+                free(x_temp);
+                return;
+            }
+
+            /* Store f(x+h) temporarily in fjac */
+            for (i = 0; i < m; i++)
+                fjac[j * m + i] = wf[i];
+
+            /* Calculate f(x - h) */
+            x_temp[j] = temp - step;
+            (*evaluate)(x_temp, m, data, wf, userbreak);
+            (*nfev)++;
+            if (*userbreak)
+            {
+                free(x_temp);
+                return;
+            }
+
+            /* Compute central difference: [f(x+h) - f(x-h)] / (2*h) */
+            for (i = 0; i < m; i++)
+                fjac[j * m + i] = (fjac[j * m + i] - wf[i]) / (2 * step);
+        }
+    }
+
+    free(x_temp);
+}
+
+static void lm_compute_analytical_jacobian(
+    const int n, const int m, const double *const x_external,
+    const void *const data,
+    void (*const jacobian_func)(
+        const double *const par, const int m_dat, const void *const data,
+        double *const fjac, int *const userbreak),
+    double *const fjac, const lm_bounds_struct *bounds, int *const userbreak)
+{
+    int i, j;
+
+    /* Call user-provided analytical Jacobian */
+    (*jacobian_func)(x_external, m, data, fjac, userbreak);
+    if (*userbreak)
+        return;
+
+    /* Handle FIXED parameters by zeroing their columns */
+    if (bounds && bounds->bound_type)
+    {
+        for (j = 0; j < n; j++)
+        {
+            if (bounds->bound_type[j] == LM_BOUND_FIXED)
+            {
+                for (i = 0; i < m; i++)
+                    fjac[j * m + i] = 0.0;
+            }
+        }
+    }
+}
+
+static void lm_compute_jacobian(
+    const int n, const int m, const double *const x_external,
+    const void *const data,
+    void (*const evaluate)(
+        const double *const par, const int m_dat, const void *const data,
+        double *const fvec, int *const userbreak),
+    void (*const jacobian_func)(
+        const double *const par, const int m_dat, const void *const data,
+        double *const fjac, int *const userbreak),
+    double *const fjac, double *const wf,
+    const lm_bounds_struct *bounds, int *const userbreak, int *const nfev)
+{
+    if (jacobian_func != NULL)
+    {
+        /* Use analytical Jacobian */
+        lm_compute_analytical_jacobian(n, m, x_external, data, jacobian_func,
+                                       fjac, bounds, userbreak);
+    }
+    else
+    {
+        /* Use numerical Jacobian (default) */
+        lm_compute_numerical_jacobian(n, m, x_external, data, evaluate,
+                                      fjac, wf, bounds, userbreak, nfev);
+    }
+}
+
+/*****************************************************************************/
 /*  Numeric constants                                                        */
 /*****************************************************************************/
 
@@ -475,12 +609,16 @@ static void determine_scaling_strategy(const lm_control_struct *C,
  LM_USER_TOL   1.e-14
 */
 
+/*****************************************************************************/
+/*  Preset control parameter settings                                        */
+/*****************************************************************************/
+
 LM_EXPORT const lm_control_struct lm_control_double = {
     LM_USERTOL, LM_USERTOL, LM_USERTOL, LM_USERTOL, 100., 100, 1,
-    NULL, 0, -1, -1};
+    NULL, 0, -1, -1, NULL, NULL};
 LM_EXPORT const lm_control_struct lm_control_float = {
     1.e-7, 1.e-7, 1.e-7, 1.e-7, 100., 100, 1,
-    NULL, 0, -1, -1};
+    NULL, 0, -1, -1, NULL, NULL};
 
 /*****************************************************************************/
 /*  Message texts (indexed by status.info)                                   */
@@ -644,7 +782,7 @@ void lmmin2(
 {
     int i, j, k, failure;
     double actred, dirder, fnorm, fnorm1, gnorm, pnorm,
-        prered, ratio, step, sum, temp, temp1, temp2, temp3;
+        prered, ratio, sum, temp, temp1, temp2, temp3;
     static double p1 = 0.1, p0001 = 1.0e-4;
 
     int maxfev = C->patience * (n + 1);
@@ -996,49 +1134,11 @@ void lmmin2(
         }
 
         /***  [outer]  Calculate the Jacobian.  ***/
-        for (j = 0; j < n; j++)
-        {
-            /* Check if this parameter is FIXED */
-            int is_fixed = 0;
-            if (C->bounds && C->bounds->bound_type && C->bounds->bound_type[j] == LM_BOUND_FIXED)
-            {
-                is_fixed = 1;
-            }
+        lm_compute_jacobian(n, m, x_external, data, evaluate, C->jacobian,
+                            fjac, wf, C->bounds, &(S->userbreak), &(S->nfev));
 
-            if (is_fixed)
-            {
-                /* For FIXED parameters, set Jacobian column to zero */
-                for (i = 0; i < m; i++)
-                    fjac[j * m + i] = 0.0;
-            }
-            else
-            {
-                temp = x_external[j];                /* Work with internal parameters */
-                step = calculate_step_size(temp, 1); /* Use optimal step size */
-
-                /* Calculate f(x + h) and temporarily store in fjac */
-                x_external[j] = temp + step;
-                (*evaluate)(x_external, m, data, wf, &(S->userbreak));
-                ++(S->nfev);
-                if (S->userbreak)
-                    goto terminate;
-                for (i = 0; i < m; i++)
-                    fjac[j * m + i] = wf[i]; /* Store f(x+h) in fjac temporarily */
-
-                /* Calculate f(x - h) */
-                x_external[j] = temp - step;
-                (*evaluate)(x_external, m, data, wf, &(S->userbreak));
-                ++(S->nfev);
-                if (S->userbreak)
-                    goto terminate;
-
-                /* Compute central difference: [f(x+h) - f(x-h)] / (2*h) */
-                for (i = 0; i < m; i++)
-                    fjac[j * m + i] = (fjac[j * m + i] - wf[i]) / (2 * step);
-
-                x_external[j] = temp; /* Restore original parameter value */
-            }
-        }
+        if (S->userbreak)
+            goto terminate;
 
         /***  Apply enhanced Jacobian scaling  ***/
 
@@ -1403,46 +1503,18 @@ terminate:
             goto no_error_estimate;
 
         failure = 0;
-        for (j = 0; j < n; j++)
-        {
-            /* Check if this parameter is FIXED */
-            int is_fixed = 0;
-            if (C->bounds && C->bounds->bound_type && C->bounds->bound_type[j] == LM_BOUND_FIXED)
-            {
-                is_fixed = 1;
-            }
+        int temp_nfev = 0;
 
-            if (is_fixed)
-            {
-                /* For FIXED parameters, set Jacobian column to zero */
-                for (i = 0; i < m; i++)
-                    fjac[j * m + i] = 0.0;
-            }
-            else
-            {
-                temp = x[j];
-                step = calculate_step_size(temp, 1);
-                x[j] = temp + step;
-                (*evaluate)(x, m, data, wf, &failure);
-                if (failure)
-                    goto no_error_estimate;
-                for (i = 0; i < m; i++)
-                    fjac[j * m + i] = wf[i]; /* Store f(x+h) in fjac temporarily */
+        /* Use the unified Jacobian computation function */
+        lm_compute_jacobian(n, m, x, data, evaluate, C->jacobian,
+                            fjac, wf, C->bounds, &failure, &temp_nfev);
+        S->nfev += temp_nfev;
 
-                /* Calculate f(x - h) */
-                x[j] = temp - step;
-                (*evaluate)(x, m, data, wf, &(S->userbreak));
-                ++(S->nfev);
-                if (S->userbreak)
-                    goto terminate;
+        if (failure)
+            goto no_error_estimate;
 
-                /* Compute central difference: [f(x+h) - f(x-h)] / (2*h) */
-                for (i = 0; i < m; i++)
-                    fjac[j * m + i] = (fjac[j * m + i] - wf[i]) / (2 * step);
+        /* Continue with Hessian computation */
 
-                x[j] = temp; /* restore */
-            }
-        }
         for (j = 0; j < n; j++)
         {
             for (k = 0; k < n; k++)
