@@ -539,10 +539,15 @@ void test_all_configurations(const double *initial_par)
         }
 
         printf("\nLegend:\n");
-        printf("  NONE: No bounds (unbounded optimization)\n");
-        printf("  BOTH: Both lower and upper bounds [1e-8, 1e+8]\n");
-        printf("  LOG:  Logarithmic transformation (always positive)\n");
-        printf("  step: stepbound parameter for trust region\n\n");
+        printf("  NONE:  No bounds (unbounded optimization)\n");
+        printf("  LOWER: Lower bounds only [1e-12, inf)\n");
+        printf("  UPPER: Upper bounds only (-inf, 1e+6]\n");
+        printf("  BOTH:  Both lower and upper bounds [1e-8, 1e+8]\n");
+        printf("  FIXED: Fixed parameters (not optimized)\n");
+        printf("  LOG:   Logarithmic transformation (always positive)\n");
+        printf("  step:  stepbound parameter for trust region\n");
+        printf("  auto scaling: automatic parameter scaling by lmmin\n");
+        printf("  user scaling: Rs=10, Rct=100, Cdl=1e-6\n\n");
     }
 }
 
