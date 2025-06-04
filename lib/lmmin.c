@@ -45,6 +45,7 @@ void lm_qrsolv(
 static double calculate_optimal_step_size(double x, int points, int order)
 {
     const double epsilon = 2.22e-16; // DBL_EPSILON (machine precision)
+    double sqrtEpsilon = sqrt(epsilon);
 
     // Calculate accuracy order for finite difference
     int accuracy = points - order;
@@ -53,16 +54,7 @@ static double calculate_optimal_step_size(double x, int points, int order)
     // For 3-point central difference (points=3, order=1): ε^(1/3)
     double base_step = pow(epsilon, 1.0 / (accuracy + order));
 
-    // Scale by parameter magnitude: h * (1 + |x|)
-    // This ensures relative accuracy for both small and large parameter values
-    double step_size = base_step * (1.0 + fabs(x));
-
-    // Optional: clamp to reasonable bounds to prevent numerical issues
-    const double min_step = 1e-12;
-    const double max_step = 1e-4;
-    step_size = fmax(min_step, fmin(max_step, step_size));
-
-    return step_size;
+    return base_step * fmax(sqrtEpsilon, fabs(x));
 }
 
 static double calculate_step_size(double x, int use_optimal_step)
@@ -81,6 +73,22 @@ static double calculate_step_size(double x, int use_optimal_step)
 /*****************************************************************************/
 /*  Parameter projection functions for bound constraints                     */
 /*****************************************************************************/
+const char *bound_type_name(int bound_type)
+{
+    switch (bound_type)
+    {
+    case LM_BOUND_NONE:
+        return "NONE";
+    case LM_BOUND_LOWER:
+        return "LOWER";
+    case LM_BOUND_UPPER:
+        return "UPPER";
+    case LM_BOUND_BOTH:
+        return "BOTH";
+    default:
+        return "UNKNOWN";
+    }
+}
 
 static double get_safe_scale(double scale_value, double fallback_scale, const char *source)
 {
@@ -593,25 +601,85 @@ LM_EXPORT const char *lm_shortmsg[] = {
 /*  Monitoring auxiliaries.                                                  */
 /*****************************************************************************/
 
-void lm_print_pars(const int nout, const double *par, FILE *fout,
-                   const lm_bounds_struct *bounds)
+void lm_print_pars(const int nout, const double *pext, const double *pint,
+                   const lm_bounds_struct *bounds,
+                   const double *auto_scales,
+                   int use_auto_scale,
+                   FILE *fout)
 {
-    fprintf(fout, "  pars:");
+    if (nout <= 0 || !fout || !pext || !pint)
+        return;
 
-    if (bounds)
+    fprintf(fout, "  Parameters: external [bounds] scale -> internal\n");
+
+    for (int i = 0; i < nout; i++)
     {
-        /* If bounds exist, check if par is internal or external */
-        /* For this function, we'll assume par is always what should be displayed */
-        for (int i = 0; i < nout; ++i)
-            fprintf(fout, " %23.16g", par[i]);
+        fprintf(fout, "    par[%d]: %12.6g ", i, pext[i]);
+
+        /* Print bounds */
+        int is_both_bounds = 0;
+        if (bounds && bounds->bound_type)
+        {
+            if (bounds->bound_type[i] == LM_BOUND_BOTH)
+            {
+                fprintf(fout, "[%.3f, %.3f] ", bounds->lower[i], bounds->upper[i]);
+                is_both_bounds = 1;
+            }
+            else if (bounds->bound_type[i] == LM_BOUND_LOWER)
+            {
+                fprintf(fout, "[%.3f, +inf) ", bounds->lower[i]);
+            }
+            else if (bounds->bound_type[i] == LM_BOUND_UPPER)
+            {
+                fprintf(fout, "(-inf, %.3f] ", bounds->upper[i]);
+            }
+            else
+            {
+                fprintf(fout, "(-inf, +inf) ");
+            }
+        }
+        else
+        {
+            fprintf(fout, "(-inf, +inf) ");
+        }
+
+        /* Print scale information - only if not BOTH bounds */
+        if (!is_both_bounds)
+        {
+            if (bounds && bounds->scales)
+            {
+                fprintf(fout, "/%.3g ", bounds->scales[i]);
+            }
+            else if (use_auto_scale && auto_scales)
+            {
+                fprintf(fout, "/auto ");
+            }
+            else
+            {
+                fprintf(fout, "/1 ");
+            }
+        }
+
+        fprintf(fout, "-> %12.6g\n", pint[i]);
+    }
+
+    /* Print scaling summary */
+    if (bounds && bounds->bound_type && bounds->bound_type[0] == LM_BOUND_BOTH)
+    {
+        fprintf(fout, "  Scaling: Not applicable (both bounds)\n");
+    }
+    else if (bounds && bounds->scales)
+    {
+        fprintf(fout, "  Scaling: User-provided scales\n");
+    }
+    else if (use_auto_scale)
+    {
+        fprintf(fout, "  Scaling: Auto scaling enabled\n");
     }
     else
     {
-        /* No bounds, parameters are already external */
-        for (int i = 0; i < nout; ++i)
-            fprintf(fout, " %23.16g", par[i]);
+        fprintf(fout, "  Scaling: No scaling (identity)\n");
     }
-    fprintf(fout, "\n");
 }
 
 /*****************************************************************************/
@@ -675,11 +743,61 @@ void lmmin2(
     double *auto_scales = NULL; /* Auto-computed scaling factors */
     int has_bounds = (C->bounds != NULL);
 
-    /* Determine effective auto scaling - disabled if user provided scales */
     int use_auto_scale = C->scale_diag;
-    if (has_bounds && C->bounds->scales)
+
+    /* Check bounds configuration - all parameters must have same bound type
+
+    Valid Configurations
+    Case 1: All BOTH bounds
+    {LM_BOUND_BOTH, LM_BOUND_BOTH, LM_BOUND_BOTH}   // scaling disabled
+    Case 2: All LOWER bounds
+    {LM_BOUND_LOWER, LM_BOUND_LOWER, LM_BOUND_LOWER} // scaling allowed
+    Case 3: All UPPER bounds
+    {LM_BOUND_UPPER, LM_BOUND_UPPER, LM_BOUND_UPPER} // scaling allowed
+    Case 4: All NONE (unbounded)
+    {LM_BOUND_NONE, LM_BOUND_NONE, LM_BOUND_NONE}   // scaling allowed
+
+    Mixed types - ALL REJECTED
+    {LM_BOUND_BOTH, LM_BOUND_LOWER, LM_BOUND_NONE}
+    {LM_BOUND_LOWER, LM_BOUND_UPPER, LM_BOUND_NONE}
+    {LM_BOUND_BOTH, LM_BOUND_NONE, LM_BOUND_BOTH}
+    */
+
+    if (has_bounds && C->bounds->bound_type)
     {
-        use_auto_scale = 0; /* User provided explicit scales - disable auto scaling */
+        int first_bound_type = C->bounds->bound_type[0];
+
+        /* Verify all parameters have identical bound type */
+        for (int i = 1; i < n; i++)
+        {
+            if (C->bounds->bound_type[i] != first_bound_type)
+            {
+                if (C->verbosity & 1)
+                {
+                    fprintf(msgfile, "Error: All parameters must have identical bound type\n");
+                    fprintf(msgfile, "       Found: par[0]=%s, par[%d]=%s\n",
+                            bound_type_name(first_bound_type), i, bound_type_name(C->bounds->bound_type[i]));
+                }
+                S->outcome = 10; /* Configuration error */
+                return;
+            }
+        }
+
+        /* Apply bound-type specific rules */
+        if (first_bound_type == LM_BOUND_BOTH)
+        {
+            use_auto_scale = 0; /* Both bounds: scaling meaningless */
+            if (C->scale_diag && (C->verbosity & 1))
+            {
+                fprintf(msgfile, "Note: scale_diag disabled for both bounds (scaling not applicable)\n");
+            }
+        }
+    }
+
+    /* Determine effective auto scaling */
+    if (has_bounds && C->bounds->scales && use_auto_scale)
+    {
+        use_auto_scale = 0; /* User provided explicit scales */
         if (C->scale_diag && (C->verbosity & 1))
         {
             fprintf(msgfile, "Note: scale_diag disabled due to user-provided scales\n");
@@ -834,19 +952,20 @@ void lmmin2(
         auto_scales = NULL;
     }
 
-    /* Let lm_project_to_internal handle all the logic */
-    lm_project_to_internal(n, x, x_internal, C->bounds, auto_scales, use_auto_scale);
+    /***  Initialize x_internal and x_external.  ***/
+
+    memcpy(x_external, x, n * sizeof(double));
+
+    lm_project_to_internal(n, x_external, x_internal, C->bounds, auto_scales, use_auto_scale);
 
     /***  Evaluate function at starting point and calculate norm.  ***/
 
     if (C->verbosity & 1)
-        fprintf(msgfile, "lmmin start (ftol=%g gtol=%g xtol=%g)\n",
+        fprintf(msgfile, "lmmin start (ftol = %g gtol = %g xtol = %g)\n",
                 C->ftol, C->gtol, C->xtol);
     if (C->verbosity & 2)
-        lm_print_pars(nout, x, msgfile, C->bounds); // Print initial parameters
+        lm_print_pars(nout, x_external, x_internal, C->bounds, auto_scales, use_auto_scale, msgfile); // Print initial parameters
 
-    /* Function evaluation with parameter transformation */
-    lm_project_to_external(n, x_internal, x_external, C->bounds, auto_scales, use_auto_scale);
     (*evaluate)(x_external, m, data, fvec, &(S->userbreak));
 
     if (C->verbosity & 8)
@@ -920,13 +1039,12 @@ void lmmin2(
         }
 
         /***  [outer]  Calculate the Jacobian.  ***/
-
         for (j = 0; j < n; j++)
         {
             temp = x_internal[j];                /* Work with internal parameters */
-            step = calculate_step_size(temp, 1); // Use optimal step size
+            step = calculate_step_size(temp, 1); /* Use optimal step size */
 
-            /* Central difference calculation */
+            /* Calculate f(x + h) and temporarily store in fjac */
             x_internal[j] = temp + step;
             lm_project_to_external(n, x_internal, x_external, C->bounds, auto_scales, use_auto_scale);
             (*evaluate)(x_external, m, data, wf, &(S->userbreak));
@@ -934,18 +1052,21 @@ void lmmin2(
             if (S->userbreak)
                 goto terminate;
             for (i = 0; i < m; i++)
-                wa1[i] = wf[i]; /* Store f(x+h) */
+                fjac[j * m + i] = wf[i]; /* Store f(x+h) in fjac temporarily */
 
+            /* Calculate f(x - h) */
             x_internal[j] = temp - step;
             lm_project_to_external(n, x_internal, x_external, C->bounds, auto_scales, use_auto_scale);
             (*evaluate)(x_external, m, data, wf, &(S->userbreak));
             ++(S->nfev);
             if (S->userbreak)
                 goto terminate;
-            for (i = 0; i < m; i++)
-                fjac[j * m + i] = (wa1[i] - wf[i]) / (2 * step);
 
-            x_internal[j] = temp; /* restore */
+            /* Compute central difference: [f(x+h) - f(x-h)] / (2*h) */
+            for (i = 0; i < m; i++)
+                fjac[j * m + i] = (fjac[j * m + i] - wf[i]) / (2 * step);
+
+            x_internal[j] = temp; /* Restore original parameter value */
         }
 
         /***  Apply enhanced Jacobian scaling  ***/
@@ -1318,7 +1439,7 @@ terminate:
 
             /* Function evaluation with bounds handling */
             lm_project_to_external(n, x_internal, x_external, C->bounds, auto_scales, use_auto_scale);
-            (*evaluate)(x_external, m, data, wf, &failure);
+            (*evaluate)(x, m, data, wf, &failure);
 
             if (failure)
                 goto no_error_estimate;
@@ -1359,11 +1480,14 @@ terminate:
 end_error_estimate:;
 
     /***  Messages.  ***/
+    // Note: x is already in external form
+    lm_project_to_internal(n, x, x_internal, C->bounds, auto_scales, use_auto_scale);
+
     if (C->verbosity & 1)
         fprintf(msgfile, "lmmin terminates with outcome %i\n", S->outcome);
     if (C->verbosity & 2)
         /* Always print external parameters for user readability */
-        lm_print_pars(nout, x, msgfile, NULL);
+        lm_print_pars(nout, x, x_internal, C->bounds, auto_scales, use_auto_scale, msgfile);
     if (C->verbosity & 8)
     {
         if (y)
@@ -1375,7 +1499,10 @@ end_error_estimate:;
                 fprintf(msgfile, "    i, f: %4i %18.8g\n", i, fvec[i]);
     }
     if (C->verbosity & 2)
-        fprintf(msgfile, "  fnorm=%24.16g xnorm=%24.16g\n", S->fnorm, xnorm);
+    {
+        fprintf(msgfile, "  fnorm = %24.16g\n", S->fnorm);
+        fprintf(msgfile, "  xnorm = %24.16g\n", xnorm);
+    }
 
     /***  Deallocate the workspace.  ***/
     free(ws);
