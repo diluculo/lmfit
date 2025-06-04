@@ -4,6 +4,7 @@ set(demos
     nonlin1
     eis
     randles
+    battery
     )
 
 foreach(app ${demos})

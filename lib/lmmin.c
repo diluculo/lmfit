@@ -690,7 +690,7 @@ void lmmin2(
     Case 4: All NONE (unbounded)
     {LM_BOUND_NONE, LM_BOUND_NONE, LM_BOUND_NONE}   // scaling allowed
 
-    Mixed types - ALL REJECTED
+    REJECTED: Mixed non-FIXED types
     {LM_BOUND_BOTH, LM_BOUND_LOWER, LM_BOUND_NONE}
     {LM_BOUND_LOWER, LM_BOUND_UPPER, LM_BOUND_NONE}
     {LM_BOUND_BOTH, LM_BOUND_NONE, LM_BOUND_BOTH}
@@ -698,31 +698,54 @@ void lmmin2(
 
     if (has_bounds && C->bounds->bound_type)
     {
-        int first_bound_type = C->bounds->bound_type[0];
+        /* Count active (non-FIXED) parameters and determine their bound type */
+        int active_bound_type = -1;
+        int active_count = 0;
 
-        /* Verify all parameters have identical bound type */
-        for (int i = 1; i < n; i++)
+        for (int i = 0; i < n; i++)
         {
-            if (C->bounds->bound_type[i] != first_bound_type)
+            if (C->bounds->bound_type[i] != LM_BOUND_FIXED)
             {
-                if (C->verbosity & 1)
+                active_count++;
+                if (active_bound_type == -1)
                 {
-                    fprintf(msgfile, "Error: All parameters must have identical bound type\n");
-                    fprintf(msgfile, "       Found: par[0]=%s, par[%d]=%s\n",
-                            bound_type_name(first_bound_type), i, bound_type_name(C->bounds->bound_type[i]));
+                    /* First active parameter sets the reference bound type */
+                    active_bound_type = C->bounds->bound_type[i];
                 }
-                S->outcome = 10; /* Configuration error */
-                return;
+                else if (C->bounds->bound_type[i] != active_bound_type)
+                {
+                    /* Found inconsistent bound types among active parameters */
+                    if (C->verbosity & 1)
+                    {
+                        fprintf(msgfile, "Error: All active (non-FIXED) parameters must have identical bound type\n");
+                        fprintf(msgfile, "       Expected: %s, but par[%d] has: %s\n",
+                                bound_type_name(active_bound_type), i, bound_type_name(C->bounds->bound_type[i]));
+                        fprintf(msgfile, "       Note: FIXED parameters can be mixed with any bound type\n");
+                    }
+                    S->outcome = 10; /* Configuration error */
+                    return;
+                }
             }
         }
 
-        /* Apply bound-type specific rules */
-        if (first_bound_type == LM_BOUND_BOTH)
+        /* Apply bound-type specific rules based on active parameters */
+        if (active_count > 0 && active_bound_type == LM_BOUND_BOTH)
         {
             use_auto_scale = 0; /* Both bounds: scaling meaningless */
             if (C->scale_diag && (C->verbosity & 1))
             {
                 fprintf(msgfile, "Note: scale_diag disabled for both bounds (scaling not applicable)\n");
+            }
+        }
+
+        if (C->verbosity & 1)
+        {
+            int fixed_count = n - active_count;
+            if (fixed_count > 0)
+            {
+                fprintf(msgfile, "Info: %d FIXED parameters, %d active parameters with %s bounds\n",
+                        fixed_count, active_count,
+                        active_count > 0 ? bound_type_name(active_bound_type) : "no");
             }
         }
     }
@@ -975,30 +998,46 @@ void lmmin2(
         /***  [outer]  Calculate the Jacobian.  ***/
         for (j = 0; j < n; j++)
         {
-            temp = x_external[j];                /* Work with internal parameters */
-            step = calculate_step_size(temp, 1); /* Use optimal step size */
+            /* Check if this parameter is FIXED */
+            int is_fixed = 0;
+            if (C->bounds && C->bounds->bound_type && C->bounds->bound_type[j] == LM_BOUND_FIXED)
+            {
+                is_fixed = 1;
+            }
 
-            /* Calculate f(x + h) and temporarily store in fjac */
-            x_external[j] = temp + step;
-            (*evaluate)(x_external, m, data, wf, &(S->userbreak));
-            ++(S->nfev);
-            if (S->userbreak)
-                goto terminate;
-            for (i = 0; i < m; i++)
-                fjac[j * m + i] = wf[i]; /* Store f(x+h) in fjac temporarily */
+            if (is_fixed)
+            {
+                /* For FIXED parameters, set Jacobian column to zero */
+                for (i = 0; i < m; i++)
+                    fjac[j * m + i] = 0.0;
+            }
+            else
+            {
+                temp = x_external[j];                /* Work with internal parameters */
+                step = calculate_step_size(temp, 1); /* Use optimal step size */
 
-            /* Calculate f(x - h) */
-            x_external[j] = temp - step;
-            (*evaluate)(x_external, m, data, wf, &(S->userbreak));
-            ++(S->nfev);
-            if (S->userbreak)
-                goto terminate;
+                /* Calculate f(x + h) and temporarily store in fjac */
+                x_external[j] = temp + step;
+                (*evaluate)(x_external, m, data, wf, &(S->userbreak));
+                ++(S->nfev);
+                if (S->userbreak)
+                    goto terminate;
+                for (i = 0; i < m; i++)
+                    fjac[j * m + i] = wf[i]; /* Store f(x+h) in fjac temporarily */
 
-            /* Compute central difference: [f(x+h) - f(x-h)] / (2*h) */
-            for (i = 0; i < m; i++)
-                fjac[j * m + i] = (fjac[j * m + i] - wf[i]) / (2 * step);
+                /* Calculate f(x - h) */
+                x_external[j] = temp - step;
+                (*evaluate)(x_external, m, data, wf, &(S->userbreak));
+                ++(S->nfev);
+                if (S->userbreak)
+                    goto terminate;
 
-            x_external[j] = temp; /* Restore original parameter value */
+                /* Compute central difference: [f(x+h) - f(x-h)] / (2*h) */
+                for (i = 0; i < m; i++)
+                    fjac[j * m + i] = (fjac[j * m + i] - wf[i]) / (2 * step);
+
+                x_external[j] = temp; /* Restore original parameter value */
+            }
         }
 
         /***  Apply enhanced Jacobian scaling  ***/
@@ -1362,30 +1401,47 @@ terminate:
     {
         if (S->fnorm <= LM_DWARF)
             goto no_error_estimate;
+
         failure = 0;
         for (j = 0; j < n; j++)
         {
-            temp = x[j];
-            step = calculate_step_size(temp, 1);
-            x[j] = temp + step;
-            (*evaluate)(x, m, data, wf, &failure);
-            if (failure)
-                goto no_error_estimate;
-            for (i = 0; i < m; i++)
-                fjac[j * m + i] = wf[i]; /* Store f(x+h) in fjac temporarily */
+            /* Check if this parameter is FIXED */
+            int is_fixed = 0;
+            if (C->bounds && C->bounds->bound_type && C->bounds->bound_type[j] == LM_BOUND_FIXED)
+            {
+                is_fixed = 1;
+            }
 
-            /* Calculate f(x - h) */
-            x[j] = temp - step;
-            (*evaluate)(x, m, data, wf, &(S->userbreak));
-            ++(S->nfev);
-            if (S->userbreak)
-                goto terminate;
+            if (is_fixed)
+            {
+                /* For FIXED parameters, set Jacobian column to zero */
+                for (i = 0; i < m; i++)
+                    fjac[j * m + i] = 0.0;
+            }
+            else
+            {
+                temp = x[j];
+                step = calculate_step_size(temp, 1);
+                x[j] = temp + step;
+                (*evaluate)(x, m, data, wf, &failure);
+                if (failure)
+                    goto no_error_estimate;
+                for (i = 0; i < m; i++)
+                    fjac[j * m + i] = wf[i]; /* Store f(x+h) in fjac temporarily */
 
-            /* Compute central difference: [f(x+h) - f(x-h)] / (2*h) */
-            for (i = 0; i < m; i++)
-                fjac[j * m + i] = (fjac[j * m + i] - wf[i]) / (2 * step);
+                /* Calculate f(x - h) */
+                x[j] = temp - step;
+                (*evaluate)(x, m, data, wf, &(S->userbreak));
+                ++(S->nfev);
+                if (S->userbreak)
+                    goto terminate;
 
-            x[j] = temp; /* restore */
+                /* Compute central difference: [f(x+h) - f(x-h)] / (2*h) */
+                for (i = 0; i < m; i++)
+                    fjac[j * m + i] = (fjac[j * m + i] - wf[i]) / (2 * step);
+
+                x[j] = temp; /* restore */
+            }
         }
         for (j = 0; j < n; j++)
         {
@@ -1410,7 +1466,7 @@ terminate:
     no_error_estimate:
         if (dx)
             for (j = 0; j < n; j++)
-                dx[j] = 0.;
+                dx[j] = -0.;
         if (covar)
             for (i = 0; i < n * n; i++)
                 covar[i] = 0.;

@@ -617,8 +617,8 @@ void test_all_configurations(const double *initial_par)
     printf("Initial parameters: Rs=1,    Rct=1,     Cdl=1\n\n");
 
     /* Results summary table */
-    printf("Configuration                          | Weighting Method      | Final fnorm   | Rs         | Rct        | Cdl        | Outcome\n");
-    printf("---------------------------------------|-----------------------|---------------|------------|------------|------------|--------\n");
+    printf("Configuration                          | Weighting Method      | chi2_reduced  | Rs         | Rct        | Cdl        | Outcome\n");
+    printf("---------------------------------------|-----------------------|---------------|------------|------------|------------|------------------\n");
 
     for (int c = 0; c < num_configs; c++)
     {
@@ -634,6 +634,9 @@ void test_all_configurations(const double *initial_par)
         {
             /* Reset parameters to initial guess */
             double par[3] = {initial_par[0], initial_par[1], initial_par[2]};
+            double par_errors[3] = {0};
+            double covar[9] = {0}; /* 3x3 covariance matrix */
+
             evaluation_count = 0;
 
             /* Set weighting method */
@@ -653,19 +656,39 @@ void test_all_configurations(const double *initial_par)
 
             /* Run optimization */
             lm_status_struct status;
-            lmmin2(n_par, par, NULL, NULL, 2 * N, NULL, NULL, evaluate_residuals, &control, &status);
+            lmmin2(n_par, par, par_errors, covar, 2 * N, NULL, NULL, evaluate_residuals, &control, &status);
+
+            /* Calculate degrees of freedom and reduced chi-squared */
+            int fixed_params = 0;
+            for (int i = 0; i < n_par; i++)
+            {
+                if (!bounds->bound_type || bounds->bound_type[i] != LM_BOUND_FIXED)
+                {
+                    fixed_params++;
+                }
+            }
+            int dof = 2 * N - fixed_params;
+            double chi2_reduced = (dof > 0) ? (status.fnorm * status.fnorm) / dof : 0.0;
 
             /* Print summary row */
             printf("%-38s | %-21s | %13.6e | %10.4g | %10.4g | %10.4g | %s\n",
                    configs[c].config_name,
                    method_names[m],
-                   status.fnorm,
+                   chi2_reduced,
                    par[0], par[1], par[2],
                    lm_shortmsg[status.outcome]);
+
+            /* Print standard errors row */
+            printf("%-38s | %-21s | %-13s | %10.4g | %10.4g | %10.4g | %s\n",
+                   "",
+                   "(std errors)",
+                   "",
+                   par_errors[0], par_errors[1], par_errors[2],
+                   "");
         }
 
         cleanup_bounds(bounds);
-        printf("---------------------------------------|-----------------------|---------------|------------|------------|------------|--------\n");
+        printf("---------------------------------------|-----------------------|---------------|------------|------------|------------|------------------\n");
     }
 
     printf("\nLegend:\n");
