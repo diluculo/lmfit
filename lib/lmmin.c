@@ -85,6 +85,8 @@ const char *bound_type_name(int bound_type)
         return "UPPER";
     case LM_BOUND_BOTH:
         return "BOTH";
+    case LM_BOUND_LOG:
+        return "LOG";
     default:
         return "UNKNOWN";
     }
@@ -117,108 +119,6 @@ static double get_safe_scale(double scale_value, double fallback_scale, const ch
         }
         return fallback_scale;
     }
-}
-
-/* Safe parameter scaling that handles negative parameter values and bound validation */
-static double apply_parameter_scaling(double param_value, double scale,
-                                      double lower_bound, double upper_bound,
-                                      int bound_type)
-{
-    /* Validate scale first */
-    if (scale <= 0.0 || !isfinite(scale))
-    {
-        fprintf(stderr, "Warning: Invalid scale %.6e, using 1.0\n", scale);
-        scale = 1.0; /* Safe fallback */
-    }
-
-    double adjusted_param = param_value;
-
-    /* Validate and adjust parameter based on bound constraints */
-    switch (bound_type)
-    {
-    case LM_BOUND_BOTH:
-        if (!isfinite(lower_bound) || !isfinite(upper_bound) || upper_bound <= lower_bound)
-        {
-            fprintf(stderr, "Error: Invalid bounds [%.6e, %.6e]\n", lower_bound, upper_bound);
-            break;
-        }
-        if (param_value < lower_bound)
-        {
-            fprintf(stderr, "Warning: Parameter %.6e below lower bound %.6e, adjusting\n",
-                    param_value, lower_bound);
-            adjusted_param = lower_bound + 1e-15 * fabs(lower_bound) + 1e-15;
-        }
-        else if (param_value > upper_bound)
-        {
-            fprintf(stderr, "Warning: Parameter %.6e above upper bound %.6e, adjusting\n",
-                    param_value, upper_bound);
-            adjusted_param = upper_bound - 1e-15 * fabs(upper_bound) - 1e-15;
-        }
-        break;
-
-    case LM_BOUND_LOWER:
-        if (!isfinite(lower_bound))
-        {
-            fprintf(stderr, "Error: Invalid lower bound %.6e\n", lower_bound);
-            break;
-        }
-        if (param_value < lower_bound)
-        {
-            fprintf(stderr, "Warning: Parameter %.6e below lower bound %.6e, adjusting\n",
-                    param_value, lower_bound);
-            adjusted_param = lower_bound + 1e-15 * fmax(1.0, fabs(lower_bound)) + 1e-15;
-        }
-        break;
-
-    case LM_BOUND_UPPER:
-        if (!isfinite(upper_bound))
-        {
-            fprintf(stderr, "Error: Invalid upper bound %.6e\n", upper_bound);
-            break;
-        }
-        if (param_value > upper_bound)
-        {
-            fprintf(stderr, "Warning: Parameter %.6e above upper bound %.6e, adjusting\n",
-                    param_value, upper_bound);
-            adjusted_param = upper_bound - 1e-15 * fmax(1.0, fabs(upper_bound)) - 1e-15;
-        }
-        break;
-
-    case LM_BOUND_FIXED:
-        /* For fixed parameters, use the bound value (stored in lower_bound) */
-        if (isfinite(lower_bound))
-        {
-            adjusted_param = lower_bound;
-        }
-        break;
-
-    case LM_BOUND_NONE:
-    default:
-        /* No bounds - parameter can be any finite value including negative */
-        if (!isfinite(param_value))
-        {
-            fprintf(stderr, "Warning: Non-finite parameter %.6e, using 0.0\n", param_value);
-            adjusted_param = 0.0;
-        }
-        break;
-    }
-
-    /* Apply scaling to the adjusted parameter */
-    double scaled_param = adjusted_param / scale;
-
-    /* Validate result */
-    if (!isfinite(scaled_param))
-    {
-        fprintf(stderr, "Warning: Non-finite scaled parameter (%.6e / %.6e), using fallback\n",
-                adjusted_param, scale);
-        scaled_param = adjusted_param; /* Try without scaling */
-        if (!isfinite(scaled_param))
-        {
-            scaled_param = 0.0; /* Last resort */
-        }
-    }
-
-    return scaled_param;
 }
 
 /* Project external parameters to internal parameter space.
@@ -318,6 +218,19 @@ static void lm_project_to_internal(const int n, const double *pext, double *pint
             /* Fixed parameter: preserve the value in internal space */
             pint[i] = pext[i]; /* Keep the same value */
         }
+        else if (bound_type == LM_BOUND_LOG)
+        {
+            /* Logarithmic transformation: log(Pext) */
+            if (pext[i] <= 0.0)
+            {
+                fprintf(stderr, "Error: Log transformation requires Pext > 0.0\n");
+                pint[i] = 1e-12; // Handle error case
+            }
+            else
+            {
+                pint[i] = log(pext[i] / scale); // Apply scaling
+            }
+        }
         else
         {
             /* Case 4: No bounds - apply scaling only if available */
@@ -412,6 +325,11 @@ static void lm_project_to_external(const int n, const double *pint, double *pext
         {
             pext[i] = bounds->lower[i]; /* Fixed value */
         }
+        else if (bound_type == LM_BOUND_LOG)
+        {
+            /* Logarithmic transformation: exp(Pint) * scale */
+            pext[i] = exp(pint[i]) * scale; // Apply scaling
+        }
         else
         {
             /* Case 4: No bounds - apply scaling only if available */
@@ -492,6 +410,10 @@ static void lm_jacobian_scale_factors(const int n, const double *pint, double *s
         else if (bounds->bound_type[i] == LM_BOUND_FIXED)
         {
             scale_factors[i] = 0.0;
+        }
+        else if (bounds->bound_type[i] == LM_BOUND_LOG)
+        {
+            scale_factors[i] = exp(pint[i]) * scale;
         }
         else
         {
@@ -618,20 +540,26 @@ void lm_print_pars(const int nout, const double *pext, const double *pint,
 
         /* Print bounds */
         int is_both_bounds = 0;
+        int has_log = 0;
         if (bounds && bounds->bound_type)
         {
             if (bounds->bound_type[i] == LM_BOUND_BOTH)
             {
-                fprintf(fout, "[%.3f, %.3f] ", bounds->lower[i], bounds->upper[i]);
+                fprintf(fout, "[%.3g, %.3g] ", bounds->lower[i], bounds->upper[i]);
                 is_both_bounds = 1;
             }
             else if (bounds->bound_type[i] == LM_BOUND_LOWER)
             {
-                fprintf(fout, "[%.3f, +inf) ", bounds->lower[i]);
+                fprintf(fout, "[%.3g, +inf) ", bounds->lower[i]);
             }
             else if (bounds->bound_type[i] == LM_BOUND_UPPER)
             {
-                fprintf(fout, "(-inf, %.3f] ", bounds->upper[i]);
+                fprintf(fout, "(-inf, %.3g] ", bounds->upper[i]);
+            }
+            else if (bounds->bound_type[i] == LM_BOUND_LOG)
+            {
+                fprintf(fout, "(0, +inf) ");
+                has_log = 1;
             }
             else
             {
@@ -646,17 +574,22 @@ void lm_print_pars(const int nout, const double *pext, const double *pint,
         /* Print scale information - only if not BOTH bounds */
         if (!is_both_bounds)
         {
-            if (bounds && bounds->scales)
+            if (bounds && bounds->scales && bounds->scales[i] != 0.0)
             {
-                fprintf(fout, "/%.3g ", bounds->scales[i]);
+                double scale = get_safe_scale(bounds->scales[i], 1.0, "user");
+                fprintf(fout, "%.3g ", scale);
+            }
+            else if (bounds && bounds->scales)
+            {
+                fprintf(fout, "%.3g ", bounds->scales[i]);
             }
             else if (use_auto_scale && auto_scales)
             {
-                fprintf(fout, "/auto ");
+                fprintf(fout, "auto ");
             }
             else
             {
-                fprintf(fout, "/1 ");
+                fprintf(fout, "1 ");
             }
         }
 
@@ -961,10 +894,11 @@ void lmmin2(
     /***  Evaluate function at starting point and calculate norm.  ***/
 
     if (C->verbosity & 1)
+    {
         fprintf(msgfile, "lmmin start (ftol = %g gtol = %g xtol = %g)\n",
                 C->ftol, C->gtol, C->xtol);
-    if (C->verbosity & 2)
-        lm_print_pars(nout, x_external, x_internal, C->bounds, auto_scales, use_auto_scale, msgfile); // Print initial parameters
+        lm_print_pars(nout, x_external, x_internal, C->bounds, auto_scales, use_auto_scale, msgfile);
+    }
 
     (*evaluate)(x_external, m, data, fvec, &(S->userbreak));
 
@@ -1041,12 +975,11 @@ void lmmin2(
         /***  [outer]  Calculate the Jacobian.  ***/
         for (j = 0; j < n; j++)
         {
-            temp = x_internal[j];                /* Work with internal parameters */
+            temp = x_external[j];                /* Work with internal parameters */
             step = calculate_step_size(temp, 1); /* Use optimal step size */
 
             /* Calculate f(x + h) and temporarily store in fjac */
-            x_internal[j] = temp + step;
-            lm_project_to_external(n, x_internal, x_external, C->bounds, auto_scales, use_auto_scale);
+            x_external[j] = temp + step;
             (*evaluate)(x_external, m, data, wf, &(S->userbreak));
             ++(S->nfev);
             if (S->userbreak)
@@ -1055,8 +988,7 @@ void lmmin2(
                 fjac[j * m + i] = wf[i]; /* Store f(x+h) in fjac temporarily */
 
             /* Calculate f(x - h) */
-            x_internal[j] = temp - step;
-            lm_project_to_external(n, x_internal, x_external, C->bounds, auto_scales, use_auto_scale);
+            x_external[j] = temp - step;
             (*evaluate)(x_external, m, data, wf, &(S->userbreak));
             ++(S->nfev);
             if (S->userbreak)
@@ -1066,7 +998,7 @@ void lmmin2(
             for (i = 0; i < m; i++)
                 fjac[j * m + i] = (fjac[j * m + i] - wf[i]) / (2 * step);
 
-            x_internal[j] = temp; /* Restore original parameter value */
+            x_external[j] = temp; /* Restore original parameter value */
         }
 
         /***  Apply enhanced Jacobian scaling  ***/
@@ -1433,20 +1365,27 @@ terminate:
         failure = 0;
         for (j = 0; j < n; j++)
         {
-            temp = x_internal[j];
-            step = MAX(eps * eps, eps * fabs(temp));
-            x_internal[j] += step; /* replace temporarily */
-
-            /* Function evaluation with bounds handling */
-            lm_project_to_external(n, x_internal, x_external, C->bounds, auto_scales, use_auto_scale);
+            temp = x[j];
+            step = calculate_step_size(temp, 1);
+            x[j] = temp + step;
             (*evaluate)(x, m, data, wf, &failure);
-
             if (failure)
                 goto no_error_estimate;
             for (i = 0; i < m; i++)
-                fjac[j * m + i] = (wf[i] - fvec[i]) / step / S->fnorm;
+                fjac[j * m + i] = wf[i]; /* Store f(x+h) in fjac temporarily */
 
-            x_internal[j] = temp; /* restore */
+            /* Calculate f(x - h) */
+            x[j] = temp - step;
+            (*evaluate)(x, m, data, wf, &(S->userbreak));
+            ++(S->nfev);
+            if (S->userbreak)
+                goto terminate;
+
+            /* Compute central difference: [f(x+h) - f(x-h)] / (2*h) */
+            for (i = 0; i < m; i++)
+                fjac[j * m + i] = (fjac[j * m + i] - wf[i]) / (2 * step);
+
+            x[j] = temp; /* restore */
         }
         for (j = 0; j < n; j++)
         {
@@ -1481,13 +1420,15 @@ end_error_estimate:;
 
     /***  Messages.  ***/
     // Note: x is already in external form
-    lm_project_to_internal(n, x, x_internal, C->bounds, auto_scales, use_auto_scale);
+    // lm_project_to_internal(n, x, x_internal, C->bounds, auto_scales, use_auto_scale);
 
     if (C->verbosity & 1)
-        fprintf(msgfile, "lmmin terminates with outcome %i\n", S->outcome);
-    if (C->verbosity & 2)
-        /* Always print external parameters for user readability */
+    {
+        fprintf(msgfile, "lmmin terminates with outcome %i: %s\n",
+                S->outcome, lm_infmsg[S->outcome]);
+        fprintf(msgfile, "  function evaluations: %d\n", S->nfev);
         lm_print_pars(nout, x, x_internal, C->bounds, auto_scales, use_auto_scale, msgfile);
+    }
     if (C->verbosity & 8)
     {
         if (y)
@@ -1498,7 +1439,7 @@ end_error_estimate:;
             for (i = 0; i < m; ++i)
                 fprintf(msgfile, "    i, f: %4i %18.8g\n", i, fvec[i]);
     }
-    if (C->verbosity & 2)
+    if (C->verbosity & 1)
     {
         fprintf(msgfile, "  fnorm = %24.16g\n", S->fnorm);
         fprintf(msgfile, "  xnorm = %24.16g\n", xnorm);

@@ -3,6 +3,7 @@ set(demos
     surface1
     nonlin1
     eis
+    randles
     )
 
 foreach(app ${demos})

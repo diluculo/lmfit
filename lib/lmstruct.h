@@ -53,7 +53,8 @@ typedef enum
     LM_BOUND_LOWER = 1, /* Lower bound only */
     LM_BOUND_UPPER = 2, /* Upper bound only */
     LM_BOUND_BOTH = 3,  /* Both lower and upper bounds */
-    LM_BOUND_FIXED = 4  /* Fixed parameter (not optimized) */
+    LM_BOUND_FIXED = 4, /* Fixed parameter (not optimized) */
+    LM_BOUND_LOG = 5    /* Logarithmic transformation (always positive) */
 } lm_bound_type;
 
 /* Collection of input parameters for fit control. */

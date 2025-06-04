@@ -224,10 +224,11 @@ static void calculate_weights(Complex z_measured, Complex z_fitted,
 
     case WEIGHT_MODULUS_MEAS:
     {
-        /* Weight by 1/|Z_measured|^2 */
+        /* Weight by 1/|Z_measured| */
         double magnitude_sq = z_measured.real * z_measured.real +
                               z_measured.imag * z_measured.imag;
-        double weight = (magnitude_sq > 1e-24) ? (1.0 / magnitude_sq) : 1e24;
+        double magnitude = sqrt(magnitude_sq);
+        double weight = (magnitude > 1e-12) ? (1.0 / magnitude) : 1e12;
         *weight_real = weight;
         *weight_imag = weight;
         break;
@@ -235,21 +236,21 @@ static void calculate_weights(Complex z_measured, Complex z_fitted,
 
     case WEIGHT_PROPORTIONAL_MEAS:
     {
-        /* Weight by 1/|Re_measured|^2 and 1/|Im_measured|^2 separately */
-        double real_sq = z_measured.real * z_measured.real;
-        double imag_sq = z_measured.imag * z_measured.imag;
+        /* Weight by 1/|Re_measured| and 1/|Im_measured| separately */
+        double real_abs = fabs(z_measured.real);
+        double imag_abs = fabs(z_measured.imag);
 
-        *weight_real = (real_sq > 1e-24) ? (1.0 / real_sq) : 1e24;
-        *weight_imag = (imag_sq > 1e-24) ? (1.0 / imag_sq) : 1e24;
+        *weight_real = (real_abs > 1e-12) ? (1.0 / real_abs) : 1e12; // 1/|Re|
+        *weight_imag = (imag_abs > 1e-12) ? (1.0 / imag_abs) : 1e12; // 1/|Im|
         break;
     }
 
     case WEIGHT_MODULUS_FIT:
     {
-        /* Weight by 1/|Z_fitted|^2 */
-        double magnitude_sq = z_fitted.real * z_fitted.real +
-                              z_fitted.imag * z_fitted.imag;
-        double weight = (magnitude_sq > 1e-24) ? (1.0 / magnitude_sq) : 1e24;
+        /* Weight by 1/|Z_fitted| */
+        double magnitude = sqrt(z_fitted.real * z_fitted.real +
+                                z_fitted.imag * z_fitted.imag);
+        double weight = (magnitude > 1e-12) ? (1.0 / magnitude) : 1e12;
         *weight_real = weight;
         *weight_imag = weight;
         break;
@@ -257,12 +258,12 @@ static void calculate_weights(Complex z_measured, Complex z_fitted,
 
     case WEIGHT_PROPORTIONAL_FIT:
     {
-        /* Weight by 1/|Re_fitted|^2 and 1/|Im_fitted|^2 separately */
-        double real_sq = z_fitted.real * z_fitted.real;
-        double imag_sq = z_fitted.imag * z_fitted.imag;
+        /* Weight by 1/|Re_fitted| and 1/|Im_fitted| separately */
+        double real_abs = fabs(z_fitted.real);
+        double imag_abs = fabs(z_fitted.imag);
 
-        *weight_real = (real_sq > 1e-24) ? (1.0 / real_sq) : 1e24;
-        *weight_imag = (imag_sq > 1e-24) ? (1.0 / imag_sq) : 1e24;
+        *weight_real = (real_abs > 1e-12) ? (1.0 / real_abs) : 1e12;
+        *weight_imag = (imag_abs > 1e-12) ? (1.0 / imag_abs) : 1e12;
         break;
     }
 
@@ -435,81 +436,6 @@ void cleanup_bounds(lm_bounds_struct *bounds)
     }
 }
 
-/* Enhanced bounds verification function */
-void verify_parameter_bounds(const double *par, const lm_bounds_struct *bounds,
-                             const char **param_names, int n_par)
-{
-    printf("\nParameter bounds verification:\n");
-    int all_valid = 1;
-
-    for (int i = 0; i < n_par; ++i)
-    {
-        int is_valid = 1;
-        char bound_desc[100];
-        char status_msg[20];
-
-        printf("  %-6s = %12.6e  bounds: ", param_names[i], par[i]);
-
-        if (!bounds || bounds->bound_type[i] == LM_BOUND_NONE)
-        {
-            printf("(-oo, +oo)");
-            strcpy(status_msg, "N/A");
-        }
-        else if (bounds->bound_type[i] == LM_BOUND_BOTH)
-        {
-            double lower = bounds->lower[i];
-            double upper = bounds->upper[i];
-            printf("[%.3e, %.3e]", lower, upper);
-
-            is_valid = (par[i] >= lower && par[i] <= upper);
-            strcpy(status_msg, is_valid ? "PASS" : "FAIL");
-        }
-        else if (bounds->bound_type[i] == LM_BOUND_LOWER)
-        {
-            double lower = bounds->lower[i];
-            printf("[%.3e, +oo)", lower);
-
-            is_valid = (par[i] >= lower);
-            strcpy(status_msg, is_valid ? "PASS" : "FAIL");
-        }
-        else if (bounds->bound_type[i] == LM_BOUND_UPPER)
-        {
-            double upper = bounds->upper[i];
-            printf("(-oo, %.3e]", upper);
-
-            is_valid = (par[i] <= upper);
-            strcpy(status_msg, is_valid ? "PASS" : "FAIL");
-        }
-        else if (bounds->bound_type[i] == LM_BOUND_FIXED)
-        {
-            printf("FIXED");
-            strcpy(status_msg, "FIXED");
-        }
-        else
-        {
-            printf("unknown");
-            strcpy(status_msg, "ERROR");
-            is_valid = 0;
-        }
-
-        printf("  [%s]\n", status_msg);
-
-        if (!is_valid && bounds && bounds->bound_type[i] != LM_BOUND_NONE)
-        {
-            all_valid = 0;
-        }
-    }
-
-    if (!bounds)
-    {
-        printf("\nBounds check: No bounds specified\n");
-    }
-    else
-    {
-        printf("\nAll bounds satisfied: %s\n", all_valid ? "PASS" : "FAIL");
-    }
-}
-
 /* Function to print detailed frequency-by-frequency comparison */
 void print_frequency_comparison(const double *par)
 {
@@ -594,45 +520,15 @@ int main()
         return 1;
     }
 
-    printf("Initial parameters and bounds:\n");
-    for (int i = 0; i < n_par; ++i)
-    {
-        printf("  %-6s: %12.6g on ", param_names[i], par[i]);
-
-        if (!bounds || bounds->bound_type[i] == LM_BOUND_NONE)
-        {
-            printf("(-oo, +oo)");
-        }
-        else if (bounds->bound_type[i] == LM_BOUND_BOTH)
-        {
-            printf("[%.3e, %.3e]", bounds->lower[i], bounds->upper[i]);
-        }
-        else if (bounds->bound_type[i] == LM_BOUND_LOWER)
-        {
-            printf("[%.3e, +oo)", bounds->lower[i]);
-        }
-        else if (bounds->bound_type[i] == LM_BOUND_UPPER)
-        {
-            printf("(-oo, %.3e]", bounds->upper[i]);
-        }
-        else if (bounds->bound_type[i] == LM_BOUND_FIXED)
-        {
-            printf("FIXED");
-        }
-
-        printf("\n");
-    }
-    printf("\n");
-
     printf("Starting bounded optimization...\n\n");
 
     /* Setup control structure with bounds */
     lm_control_struct control = lm_control_double;
-    control.stepbound = 0.1; /* Initial step bound */
-    control.patience = 1000; /* Maximum number of function evaluations */
-    control.scale_diag = 1;  /* Rescale variables internally */
-    control.bounds = bounds; /* Apply bounds */
-    control.verbosity = 3;   /* Print more information */
+    control.stepbound = 10.0; /* Initial step bound */
+    control.patience = 1000;  /* Maximum number of function evaluations */
+    control.scale_diag = 0;   /* Rescale variables internally */
+    control.bounds = bounds;  /* Apply bounds */
+    control.verbosity = 3;    /* Print more information */
 
     /* Adjust tolerances for better convergence with bounds */
     control.ftol = 1e-15;
@@ -650,9 +546,6 @@ int main()
     printf("Fitted parameters:\n");
     for (int i = 0; i < n_par; ++i)
         printf("  %-6s = %.10g\n", param_names[i], par[i]);
-
-    /* Comprehensive bounds verification */
-    verify_parameter_bounds(par, bounds, param_names, n_par);
 
     /* Calculate final model fit quality */
     double total_error = 0.0;

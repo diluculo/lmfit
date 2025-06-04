@@ -30,8 +30,8 @@ Complex randles_model(double frequency, const Parameters *params)
     Complex Z_Cdl = capacitor(Cdl, w);
 
     /* Rs in series with (Rct || Cdl) */
-    Complex Z_parallel = z_par(Z_Rct, Z_Cdl);
-    return z_ser(Z_Rs, Z_parallel);
+    Complex Z_rc = z_par(Z_Rct, Z_Cdl);
+    return z_ser(Z_Rs, Z_rc);
 }
 
 /* --- Setup function for Randles model --- */
@@ -42,9 +42,9 @@ Parameters *setup_randles_parameters()
         return NULL;
 
     /* Set parameter properties with initial guesses of 1 */
-    set_parameter(params, PARAM_RS, "Rs", 1000.0, 0.0, INFINITY, LM_BOUND_LOWER, 1000.0);
-    set_parameter(params, PARAM_RCT, "Rct", 100.0, 0.0, INFINITY, LM_BOUND_LOWER, 100.0);
-    set_parameter(params, PARAM_CDL, "Cdl", 1e-5, 1e-12, INFINITY, LM_BOUND_LOWER, 1e-6);
+    set_parameter(params, PARAM_RS, "Rs", 1.0, 1e-8, 1e8, LM_BOUND_NONE, 1000.0);
+    set_parameter(params, PARAM_RCT, "Rct", 1.0, 1e-8, 1e8, LM_BOUND_NONE, 100.0);
+    set_parameter(params, PARAM_CDL, "Cdl", 1.0, 1e-8, 1e8, LM_BOUND_NONE, 1e-6);
 
     return params;
 }
@@ -58,7 +58,7 @@ EISData *generate_randles_simulation_data()
     const double Cdl_true = 1e-6;  /* 1 uF */
 
     /* Frequency range: 0.01 Hz to 100 kHz (logarithmic) */
-    const int n_points = 50;
+    const int n_points = 70;
     const double freq_min = 0.01;     /* 0.01 Hz */
     const double freq_max = 100000.0; /* 100 kHz */
 
@@ -83,7 +83,7 @@ EISData *generate_randles_simulation_data()
     double log_freq_max = log10(freq_max);
 
     printf("Generating Randles simulation data:\n");
-    printf("True parameters: Rs = %.0f ohm, Rct = %.0f ohm, Cdl = %.0f µF\n",
+    printf("True parameters: Rs = %.0f ohm, Rct = %.0f ohm, Cdl = %.0f uF\n",
            Rs_true, Rct_true, Cdl_true * 1e6);
     printf("Frequency range: %.2f Hz to %.0f Hz (%d points)\n",
            freq_min, freq_max, n_points);
@@ -154,7 +154,7 @@ void export_randles_simulation_data(const char *filename)
 
     fprintf(file, "# Simulated Randles Circuit Data\n");
     fprintf(file, "# Circuit: Rs - (Rct || Cdl)\n");
-    fprintf(file, "# True parameters: Rs=3010ohm, Rct=100ohm, Cdl=1µF\n");
+    fprintf(file, "# True parameters: Rs=3010ohm, Rct=100ohm, Cdl=1uF\n");
     fprintf(file, "# Noise level: 0.1%% of magnitude\n");
     fprintf(file, "# Frequency[Hz] Z_real[ohm] Z_imag[ohm]\n");
 
@@ -206,16 +206,16 @@ int fit_randles_to_simulation(const char *output_file)
 
     /* Setup fitting control */
     lm_control_struct control = lm_control_double;
-    control.stepbound = 100.0; /* Larger step bound for big parameter changes */
-    control.patience = 2000;   /* More iterations */
-    control.scale_diag = 1;    /* Use parameter scaling */
-    control.verbosity = 3;     /* Detailed output */
+    control.stepbound = 0.1; /* Larger step bound for big parameter changes */
+    control.patience = 2000; /* More iterations */
+    control.scale_diag = 0;  /* Use parameter scaling */
+    control.verbosity = 3;   /* Detailed output */
     control.ftol = 1e-12;
     control.xtol = 1e-12;
     control.gtol = 1e-12;
 
     /* Use modulus auto weighting */
-    set_weighting_method(ctx, WEIGHT_MODULUS_MEAS);
+    set_weighting_method(ctx, WEIGHT_UNITY);
 
     printf("Initial parameter guesses:\n");
     for (int i = 0; i < params->n_params; i++)
@@ -227,7 +227,7 @@ int fit_randles_to_simulation(const char *output_file)
     printf("True parameter values:\n");
     printf("  Rs     = %12.0f ohm\n", 3010.0);
     printf("  Rct    = %12.0f ohm\n", 100.0);
-    printf("  Cdl    = %12.0f µF\n", 1.0);
+    printf("  Cdl    = %12.0f uF\n", 1.0);
     printf("\n");
 
     /* Perform fitting */
@@ -239,8 +239,8 @@ int fit_randles_to_simulation(const char *output_file)
         printf("===============================\n");
 
         double true_values[3] = {3010.0, 100.0, 1e-6};
-        const char *units[3] = {"ohm", "ohm", "µF"};
-        double unit_factors[3] = {1.0, 1.0, 1e6}; /* Convert Cdl to µF for display */
+        const char *units[3] = {"ohm", "ohm", "uF"};
+        double unit_factors[3] = {1.0, 1.0, 1e6}; /* Convert Cdl to uF for display */
 
         printf("%-10s %12s %12s %12s %12s\n",
                "Parameter", "True", "Fitted", "Error%", "Unit");
@@ -334,12 +334,12 @@ void test_initial_guess_sensitivity()
         params->values[PARAM_CDL] = initial_guesses[test][2];
 
         FittingContext *ctx = create_fitting_context(data, randles_model, params);
-        set_weighting_method(ctx, WEIGHT_MODULUS_MEAS);
+        set_weighting_method(ctx, WEIGHT_UNITY);
 
         lm_control_struct control = lm_control_double;
-        control.stepbound = 1.0;
+        control.stepbound = 0.1;
         control.patience = 1000;
-        control.scale_diag = 1;
+        control.scale_diag = 0;
         control.verbosity = 1; /* Less verbose for multiple tests */
         control.ftol = 1e-12;
         control.xtol = 1e-12;
@@ -359,7 +359,7 @@ void test_initial_guess_sensitivity()
                     max_error = error_pct;
             }
 
-            printf("Result: Rs=%.1f, Rct=%.1f, Cdl=%.1f µF\n",
+            printf("Result: Rs=%.1f, Rct=%.1f, Cdl=%.1f uF\n",
                    params->values[0], params->values[1], params->values[2] * 1e6);
             printf("Max error: %.3f%%\n", max_error);
 

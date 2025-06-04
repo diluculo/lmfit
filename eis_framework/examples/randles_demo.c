@@ -23,23 +23,23 @@ void predict_nyquist_behavior()
     printf("Expected Nyquist Plot Behavior:\n");
     printf("==============================\n\n");
 
-    printf("For Rs=3010Ω, Rct=100Ω, Cdl=1µF:\n\n");
+    printf("For Rs=3010ohm, Rct=100ohm, Cdl=1uF:\n\n");
 
-    printf("High frequency limit (f→∞):\n");
+    printf("High frequency limit (f -> oo):\n");
     printf("  - Capacitor acts as short circuit\n");
-    printf("  - Z → Rs = 3010 Ω\n");
+    printf("  - Z -> Rs = 3010 ohm\n");
     printf("  - Real axis intercept at left\n\n");
 
-    printf("Low frequency limit (f→0):\n");
+    printf("Low frequency limit (f -> 0):\n");
     printf("  - Capacitor acts as open circuit\n");
-    printf("  - Z → Rs + Rct = 3110 Ω\n");
+    printf("  - Z -> Rs + Rct = 3110 ohm\n");
     printf("  - Real axis intercept at right\n\n");
 
     printf("Characteristic frequency:\n");
-    printf("  fc = 1/(2π·Rct·Cdl) = 1/(2π·100·1e-6) ≈ 1592 Hz\n");
+    printf("  fc = 1/(2 pi Rct Cdl) = 1/(2pi 100 1e-6) ≈ 1592 Hz\n");
     printf("  - Maximum imaginary component at this frequency\n");
     printf("  - Semicircle center: (3060, 0)\n");
-    printf("  - Semicircle radius: 50 Ω\n\n");
+    printf("  - Semicircle radius: 50 ohm\n\n");
 }
 
 /* --- Interactive menu --- */

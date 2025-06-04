@@ -42,47 +42,6 @@ void run_test(const char *test_name, lm_control_struct *control, double *par,
 
     lm_status_struct status;
 
-    printf("Starting parameters: [%g, %g, %g]\n", par[0], par[1], par[2]);
-    if (control->bounds)
-    {
-        printf("Bounds configuration:\n");
-        if (control->bounds->lower && control->bounds->upper && control->bounds->bound_type)
-        {
-            for (int i = 0; i < n; i++)
-            {
-                if (control->bounds->bound_type[i] == LM_BOUND_BOTH)
-                {
-                    printf("  par[%d]: [%.3f, %.3f]\n", i, control->bounds->lower[i], control->bounds->upper[i]);
-                }
-                else if (control->bounds->bound_type[i] == LM_BOUND_LOWER)
-                {
-                    printf("  par[%d]: [%.3f, +inf)\n", i, control->bounds->lower[i]);
-                }
-                else if (control->bounds->bound_type[i] == LM_BOUND_UPPER)
-                {
-                    printf("  par[%d]: (-inf, %.3f]\n", i, control->bounds->upper[i]);
-                }
-                else
-                {
-                    printf("  par[%d]: no bounds\n", i);
-                }
-            }
-        }
-        if (control->bounds->scales)
-        {
-            printf("User scales: [");
-            for (int i = 0; i < n; i++)
-            {
-                printf("%.1g", control->bounds->scales[i]);
-                if (i < n - 1)
-                    printf(", ");
-            }
-            printf("]\n");
-        }
-    }
-    printf("scale_diag = %d\n", control->scale_diag);
-    printf("Fitting ...\n");
-
     /* Call lmcurve */
     lmcurve(n, par, m, t, y, f, control, &status);
 
@@ -111,7 +70,7 @@ void run_test(const char *test_name, lm_control_struct *control, double *par,
     for (int i = 0; i < n; i++)
     {
         double error = fabs(par[i] - expected[i]);
-        printf("  par[%d]: obtained=%.5f, expected=%.5f, error=%.2e",
+        printf("  par[%d]: obtained = %.5f, expected = %.5f, error = %.2e",
                i, par[i], expected[i], error);
         if (error > tolerance)
         {
@@ -191,9 +150,9 @@ int main()
     /* Base control structure */
     lm_control_struct control = lm_control_double;
     control.verbosity = 3;
-    control.ftol = 1e-10;
-    control.xtol = 1e-10;
-    control.gtol = 1e-10;
+    control.ftol = 1e-8;
+    control.xtol = 1e-8;
+    control.gtol = 1e-8;
     control.patience = 1000; /* Allow enough iterations */
 
     /* TEST 1: No scaling (scale_diag = 0) */

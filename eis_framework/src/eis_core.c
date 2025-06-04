@@ -65,7 +65,14 @@ Complex z_ser_array(int count, const Complex *z)
 
 Complex z_par(Complex z1, Complex z2)
 {
-    return c_inv(c_add(c_inv(z1), c_inv(z2)));
+    Complex numerator = c_mul(z1, z2);
+    Complex denominator = c_add(z1, z2);
+    if (fabs(denominator.real) < 1e-20 && fabs(denominator.imag) < 1e-20)
+    {
+        printf("Warning: Parallel impedance with very small denominator\n");
+        return (Complex){INFINITY, INFINITY};
+    }
+    return c_div(numerator, denominator);
 }
 
 /* --- Component model functions --- */
@@ -81,10 +88,6 @@ Complex inductor(double L, double omega)
 
 Complex capacitor(double C, double omega)
 {
-    if (fabs(C) < 1e-20 || fabs(omega) < 1e-20)
-    {
-        return (Complex){0.0, -INFINITY};
-    }
     return (Complex){0.0, -1.0 / (omega * C)};
 }
 
