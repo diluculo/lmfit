@@ -10,9 +10,9 @@ option(FITTEST "Build with FitTest" OFF)
 if(NOT DEFINED BUILD_SHARED_LIBS)
     option(BUILD_SHARED_LIBS "Build as shared library" ON)
 endif()
-if(NOT DEFINED LIB_MAN)
-    option(LIB_MAN "Build library man pages" ON)
-endif()
+
+option(LIB_MAN "Build library man pages" OFF)
+
 if(NOT DEFINED LIB_INSTALL)
     option(LIB_INSTALL "Install library" ON)
 endif()
